@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>面镜 · 大模型内容安全运营面试陪练</title>
-  <link rel="stylesheet" href="/static/style.css?v=9" />
+  <link rel="stylesheet" href="/static/style.css?v=10" />
 </head>
 <body>
   <div class="noise"></div>
@@ -92,6 +92,7 @@
             <li><b>读材料</b><span>解析简历与 JD，找出必须深挖的经历和可疑点。</span></li>
             <li><b>定方案</b><span>生成 6-8 个带考察意图的问题，含场景题与追问方向。</span></li>
             <li><b>语音面</b><span>豆包全双工实时语音，像真人一样追问，可随时打断。</span></li>
+            <li><b>找教练</b><span>哪段没答好，随时叫教练：先诊断，再一步步引导你自己讲好，练完回到面试重答。</span></li>
             <li><b>出复盘</b><span>逐句对照考察意图，给分、给证据、给可直接复用的答法。</span></li>
           </ol>
 
@@ -176,7 +177,7 @@
           </div>
 
           <canvas id="orb" width="720" height="720"></canvas>
-          <div class="stage-name">面试官</div>
+          <div class="stage-name" id="stageName">面试官</div>
           <div class="stage-tip" id="stageTip">请开始你的自我介绍</div>
 
           <div class="live-caption" id="liveCaption"></div>
@@ -189,6 +190,18 @@
               </svg>
               <span id="micLabel">静音</span>
             </button>
+            <button class="ctrl coach" id="btnCoach" title="觉得刚才没答好，暂停面试，和教练练这一题">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
+                <path d="M4 5h16v10H9l-5 4z" stroke-linejoin="round"/>
+                <path d="M9 10h6" stroke-linecap="round"/>
+              </svg>
+              <span>叫教练</span>
+            </button>
+            <button class="ctrl hidden" id="btnBackRetry" title="回到面试，面试官让你重答刚才这题">回面试 · 重答这题</button>
+            <button class="ctrl hidden" id="btnBackNext" title="回到面试，直接进入下一题">回面试 · 下一题</button>
+            <button class="ctrl danger hidden" id="btnEndCoach">结束练习</button>
+            <button class="ctrl coach hidden" id="btnCoachAgain">再练一遍</button>
+            <button class="ctrl hidden" id="btnCoachReturn">返回</button>
             <button class="ctrl danger" id="btnEnd">
               <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8">
                 <rect x="4" y="4" width="16" height="16" rx="3"/>
@@ -209,7 +222,7 @@
         <aside class="card transcript-card">
           <div class="cue" id="cueCard">
             <div class="cue-head">
-              <span>提词卡</span>
+              <span id="cueTitle">提词卡</span>
               <span class="cue-nav">
                 <button class="link-btn" id="cuePrev" title="上一题（←）">‹</button>
                 <span class="muted" id="cueIdx">-</span>
@@ -275,6 +288,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=9"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

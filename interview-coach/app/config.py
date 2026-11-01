@@ -13,6 +13,8 @@ WEB_DIR = ROOT / "web"
 METHODS_FILE = ROOT / "methods" / "answer-frameworks.md"
 DATA_DIR = ROOT / "data" / "sessions"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+COACH_DIR = ROOT / "data" / "coaching"
+COACH_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _env(key: str, default: str = "") -> str:
