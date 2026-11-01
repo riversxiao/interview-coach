@@ -303,3 +303,198 @@ def build_report_user(
 - 如果候选人的回答与简历描述明显冲突（时间、职责、数据对不上），要在对应维度或 top_gaps 中明确指出。
 - 如果某位候选人的回答太少，无法判断，请在 comment 中说明“证据不足”，并给出保守分数。
 """
+
+
+# ---------------------------------------------------------------- 教练模式
+#
+# 分工和面试一样：分析脑先写一份「教练备课单」（诊断 + 引导问题 + 提示阶梯），
+# 语音脑拿着备课单做苏格拉底式对话，练完再由分析脑出一份小结。
+
+COACH_BRIEF_SYSTEM = """你是一位面试表达教练，正在为一次一对一的语音辅导「备课」。
+
+候选人在某道面试题上觉得自己答得不好，想和你单独练这一题。你会拿到：答题方法论、面试问题清单（可能附带已生成的答题框架）、候选人的简历和工作素材、这道题的原文、候选人刚才的回答（可能为空，表示他还没答过）。
+
+你的任务是写一份教练能直接照着用的备课单：
+1. 从方法论里选一个最适合这道题的框架，framework 必须和方法论中的名称完全一致；steps 按该框架骨架逐步列出。
+2. 对照骨架逐步检查候选人的回答：status 取 ok（讲到了且讲清楚）、weak（提到了但含糊、缺数字或缺「我做了什么」）、missing（完全没讲）。回答为空时全部为 todo。note 用一句话说明依据，引用原话时用「」。
+3. diagnosis 只说最关键的一个问题，不要罗列。strength 说一个真实做对的点，回答为空时留空字符串。
+4. guiding_questions 是 3-5 个引导性问题，按辅导顺序排列，目的是让候选人自己说出缺失的信息，而不是教练替他说。例如「这件事里，哪个判断是你自己做的？」「当时影响面大概多大，有数字吗？」不要问是非题。
+5. hints 是提示阶梯，从轻到重 3 级：第 1 级只提醒方向，第 2 级点出结构里缺哪一步，第 3 级给一个句式模板（用「XX」占位，不编造内容）。
+6. 只使用候选人提供的素材，绝不编造经历和数字。
+7. opening 是教练的第一句话，口语化，60 字以内：有回答时先简短肯定一个点、再抛出第一个引导问题；没有回答时请他先用 1-2 分钟试答一遍。
+8. qid 填这道题对应问题清单里的 id，对不上填 null。
+
+只输出 JSON，不要任何解释文字。JSON 结构：
+{
+  "qid": 1,
+  "framework": "框架名称",
+  "mnemonic": "口诀",
+  "steps": [{"label": "步骤名", "status": "ok | weak | missing | todo", "note": "依据"}],
+  "diagnosis": "最关键的一个问题",
+  "strength": "做对的一个点",
+  "guiding_questions": ["..."],
+  "hints": ["第 1 级", "第 2 级", "第 3 级"],
+  "target": "练完这题要达到的标准，一句话",
+  "opening": "教练第一句话"
+}
+"""
+
+
+def build_coach_brief_user(
+    methods_text: str,
+    plan: dict,
+    outlines: list,
+    resume: str,
+    materials: str,
+    question: str,
+    answer: str,
+    qid_hint=None,
+) -> str:
+    by_id = {str(o.get("id")): o for o in outlines or []}
+    lines = []
+    for q in plan.get("questions", []):
+        item = f"{q.get('id')}. [{q.get('type', '')}] {q.get('question', '')}"
+        o = by_id.get(str(q.get("id")))
+        if o:
+            steps = "；".join(f"{s.get('label')}：{s.get('points', '')}" for s in o.get("steps") or [])
+            item += f"\n   已生成框架：{o.get('framework')}（{o.get('mnemonic', '')}）{steps}"
+        lines.append(item)
+
+    return f"""【答题方法论】
+{methods_text or "（未提供，使用 STAR 结构）"}
+
+【面试问题清单】
+{chr(10).join(lines) or "（无）"}
+
+【候选人简历】
+{(resume or "（未提供）")[:4000]}
+
+【候选人补充的工作素材】
+{(materials or "（未提供）")[:4000]}
+
+【要练的这道题】
+{question}
+{f"（前端判断可能对应问题清单第 {qid_hint} 题）" if qid_hint else ""}
+
+【候选人刚才的回答】
+{answer.strip() or "（还没有回答）"}
+
+请输出备课单 JSON，steps 必须与所选框架的骨架一一对应。"""
+
+
+COACH_TEMPLATE = """你是一位面试表达教练，正在和候选人进行一对一的语音辅导。他应聘的是「{role}」。现在不是面试，是练习：你的目标是帮他把下面这道题讲得更有结构、更具体，而且要让他自己说出来，不是你替他说。
+
+【要练的题】
+{question}
+
+【他刚才的回答】
+{answer}
+
+【你的备课单】
+建议结构：{framework}（口诀：{mnemonic}）
+逐步检查：
+{steps}
+最关键的问题：{diagnosis}
+他做对的地方：{strength}
+引导问题（按顺序用，不必全用）：
+{guiding}
+提示阶梯（他卡住时从第 1 级开始给，不要一上来就给第 3 级）：
+{hints}
+练完的标准：{target}
+
+【他的素材（只能用这里有的信息，不能替他编经历和数字）】
+{materials}
+
+【你的开场白（已经说过了，不要重复）】
+{opening}
+
+【辅导节奏】
+1. 先围绕最关键的问题，用引导问题让他自己补齐缺失的信息。他补出一个点，就简短确认一句，再问下一个。
+2. 缺失信息补得差不多时，请他按「{mnemonic}」完整再讲一遍，提醒他结论先行。
+3. 他讲完后，给一句具体反馈：哪一步明显变好了，还差哪一步。只说最重要的一点。
+4. 他想再来一遍就继续；他说「可以了」「回去面试」「结束」时，用一句话总结今天这题最该记住的一点，然后保持安静。
+
+【对话规则】
+1. 一次只问一个问题，问完停下来听。每次发言 2-3 句、60 字以内。
+2. 他卡住几秒或说不知道，就按提示阶梯给提示，从轻到重。
+3. 他说「给我示范」时，可以只用他已经说过的素材示范一段，不超过 4 句，示范完请他用自己的话讲一遍。
+4. 他问你问题（比如这一步该讲什么、面试官想听什么），直接简短回答。
+5. 鼓励要具体，不要空夸；指出问题要直接，不要绕。
+6. 全程中文口语，不要使用 Markdown、编号列表、括号注释、表情符号；不要提及你是 AI。"""
+
+
+def build_coach_instructions(record: dict, session: dict) -> str:
+    brief = record.get("brief") or {}
+    status_label = {"ok": "讲到了", "weak": "讲得弱", "missing": "没讲", "todo": "待练"}
+    steps = "\n".join(
+        f"- {s.get('label')}：{status_label.get(s.get('status'), s.get('status', ''))}"
+        + (f"，{s.get('note')}" if s.get("note") else "")
+        for s in brief.get("steps") or []
+    )
+    numbered = lambda items: "\n".join(f"{i + 1}. {x}" for i, x in enumerate(items or [])) or "（无）"
+    materials = ((session.get("materials") or "") + "\n" + (session.get("resume") or "")).strip()
+    return COACH_TEMPLATE.format(
+        role=session.get("role") or "大模型内容安全运营",
+        question=record.get("question") or "",
+        answer=(record.get("answer") or "").strip()[:1500] or "（他还没回答过，开场已请他先试答一遍）",
+        framework=brief.get("framework") or "STAR",
+        mnemonic=brief.get("mnemonic") or brief.get("framework") or "结论先行",
+        steps=steps or "（无）",
+        diagnosis=brief.get("diagnosis") or "（等他先答一遍再判断）",
+        strength=brief.get("strength") or "（暂无）",
+        guiding=numbered(brief.get("guiding_questions")),
+        hints=numbered(brief.get("hints")),
+        target=brief.get("target") or "按结构讲完整，至少有一个数字和一个自己的判断",
+        materials=materials[:1800] or "（未提供）",
+        opening=brief.get("opening") or "",
+    )
+
+
+COACH_SUMMARY_SYSTEM = """你是一位面试表达教练，刚和候选人练完一道题。请基于练习逐字稿写一份简短小结，帮他记住这次练出来的东西。
+
+要求：
+1. improved_answer 是这道题练完后的最佳版本：按给定框架的顺序，只用候选人在逐字稿或素材里真实说过的信息，3-6 句，第一人称口语，可以直接复述。信息不够的地方用「XX」占位，不要编。
+2. takeaways 是 2-3 条最该记住的点，每条一句话，具体到这道题。
+3. still_missing 是还需要他课后补充的信息（例如某个数字、某一步的细节），没有就给空数组。
+4. progress 用一句话说明他从第一次回答到最后一次的变化；只练了一遍或没有回答时如实说明。
+
+只输出 JSON：
+{"improved_answer": "...", "takeaways": ["..."], "still_missing": ["..."], "progress": "..."}
+"""
+
+
+def build_coach_summary_user(record: dict, transcript_text: str, materials: str = "") -> str:
+    brief = record.get("brief") or {}
+    return f"""【练习的题】
+{record.get("question")}
+
+【建议框架】
+{brief.get("framework", "")}（{brief.get("mnemonic", "")}）：{" → ".join(s.get("label", "") for s in brief.get("steps") or [])}
+
+【练习前的回答】
+{(record.get("answer") or "（无）")[:2000]}
+
+【候选人素材】
+{(materials or "（未提供）")[:3000]}
+
+【练习逐字稿】
+{transcript_text}
+"""
+
+
+RESUME_NOTE = """
+
+【面试中途暂停过，现在继续】
+候选人中途暂停了一会儿，现在回来继续面试。不要提及暂停或教练。下面是暂停前的对话记录（最近几轮），不要重复已经问过的问题：
+{history}
+
+接下来：{next_step}"""
+
+
+def build_resume_note(history: str, action: str) -> str:
+    next_step = (
+        "你的开场白已经请他重新回答刚才那道题。认真听他这次的回答，再按正常节奏追问或进入下一题。"
+        if action == "retry"
+        else "你的开场白已经问出了下一道题。听他回答，按正常节奏继续。"
+    )
+    return RESUME_NOTE.format(history=history or "（无记录）", next_step=next_step)

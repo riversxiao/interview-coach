@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import DATA_DIR
+from .config import COACH_DIR, DATA_DIR
 
 
 def _now() -> str:
@@ -100,5 +100,58 @@ def append_turn(session: Dict[str, Any], role: str, text: str) -> Optional[Dict[
 
 
 def transcript_text(session: Dict[str, Any]) -> str:
-    names = {"interviewer": "面试官", "candidate": "候选人"}
+    names = {"interviewer": "面试官", "candidate": "候选人", "coach": "教练"}
     return "\n".join(f"{names.get(t['role'], t['role'])}：{t['text']}" for t in session["transcript"])
+
+
+# ---------------------------------------------------------------- 教练练习
+# 每次教练练习单独存一个文件，避免和面试会话的 JSON 互相覆盖（两边可能同时在写）
+
+
+def _safe(value: str) -> str:
+    return "".join(c for c in value if c.isalnum() or c in "-_")
+
+
+def _coach_dir(sid: str) -> Path:
+    return COACH_DIR / _safe(sid)
+
+
+def create_coaching(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    record = {
+        "id": uuid.uuid4().hex[:10],
+        "session_id": sid,
+        "created_at": _now(),
+        "transcript": [],
+        "summary": None,
+        **data,
+    }
+    save_coaching(record)
+    return record
+
+
+def save_coaching(record: Dict[str, Any]) -> None:
+    folder = _coach_dir(record["session_id"])
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{_safe(record['id'])}.json").write_text(
+        json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def get_coaching(sid: str, cid: str) -> Optional[Dict[str, Any]]:
+    path = _coach_dir(sid) / f"{_safe(cid)}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def list_coaching(sid: str) -> List[Dict[str, Any]]:
+    folder = _coach_dir(sid)
+    if not folder.exists():
+        return []
+    items = []
+    for f in folder.glob("*.json"):
+        try:
+            items.append(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return sorted(items, key=lambda r: r.get("created_at") or "")

@@ -32,7 +32,18 @@
     outlines: null,
     cueIndex: 0,
     cueHidden: false,
+    // 'interview' 面试官 / 'coach' 教练
+    mode: 'interview',
+    // 当前教练练习：{ id, brief, question, answer, qid, source, transcript, ended }
+    coach: null,
+    // true = 从方案页/报告页单独练一题；false = 面试中途叫教练
+    coachOnly: false,
+    coachReturnView: 'plan',
+    interviewStarted: false,
   };
+
+  const ROLE_LABEL = { candidate: '你', interviewer: '面试官', coach: '教练' };
+  const assistantRole = () => (state.mode === 'coach' ? 'coach' : 'interviewer');
 
   /* ============================================================
    * 音频：采集 -> 16k PCM，播放 <- 24k PCM
@@ -323,6 +334,7 @@
   }
 
   function startTimer() {
+    if (state.timerId) return; // 切换面试官 / 教练时计时继续
     state.startedAt = Date.now();
     state.timerId = setInterval(() => {
       state.duration = Math.floor((Date.now() - state.startedAt) / 1000);
@@ -467,6 +479,7 @@
           <div>
             <div class="q-text"><span class="q-type">${esc(TYPE_LABEL[q.type] || '问题')}</span>${esc(q.question)}</div>
             ${q.intent ? `<div class="q-meta">考察：${esc(q.intent)}</div>` : ''}
+            <button class="link-btn coach-btn" data-qidx="${index}">和教练练这题 →</button>
             <div class="outline-slot" data-qid="${esc(q.id ?? index + 1)}"><div class="outline-loading">正在整理答题框架…</div></div>
           </div>
         </li>`
@@ -638,8 +651,50 @@
 
   /* ---------------- 面试中的提词卡 ---------------- */
 
+  const STEP_STATUS = { ok: '讲到了', weak: '偏弱', missing: '没讲', todo: '待练' };
+
+  // 教练模式下，右上角显示教练的备课单（不显示引导问题，避免剧透）
+  function renderCoachCard() {
+    const card = $('#cueCard');
+    card.classList.remove('hidden');
+    card.classList.add('coach');
+    $('#cueTitle').textContent = '教练备课单';
+    $('#cuePrev').classList.add('hidden');
+    $('#cueNext').classList.add('hidden');
+    $('#cueIdx').textContent = '';
+    $('#cueToggle').textContent = state.cueHidden ? '显示' : '隐藏';
+    card.classList.toggle('collapsed', state.cueHidden);
+    if (state.cueHidden) {
+      $('#cueBody').innerHTML = '';
+      return;
+    }
+    const brief = state.coach && state.coach.brief;
+    if (!brief) {
+      $('#cueBody').innerHTML = '<div class="muted">教练正在备课…</div>';
+      return;
+    }
+    const steps = (brief.steps || [])
+      .map((st) => `<span class="cue-step st-${esc(st.status)}" title="${esc(st.note || '')}">${esc(st.label)}<small>${esc(STEP_STATUS[st.status] || '')}</small></span>`)
+      .join('<i>→</i>');
+    $('#cueBody').innerHTML = `
+      <div class="cue-q">${esc(state.coach.question)}</div>
+      <div class="cue-mnemonic">${esc(brief.mnemonic || brief.framework || '')}</div>
+      <div class="cue-steps">${steps}</div>
+      ${brief.diagnosis ? `<div class="cue-diag"><em>最关键的问题</em>${esc(brief.diagnosis)}</div>` : ''}
+      ${brief.strength ? `<div class="cue-good"><em>做对的</em>${esc(brief.strength)}</div>` : ''}
+      ${brief.target ? `<div class="cue-target"><em>练完的标准</em>${esc(brief.target)}</div>` : ''}`;
+  }
+
   function renderCue() {
     const card = $('#cueCard');
+    if (state.mode === 'coach') {
+      renderCoachCard();
+      return;
+    }
+    card.classList.remove('coach');
+    $('#cueTitle').textContent = '提词卡';
+    $('#cuePrev').classList.remove('hidden');
+    $('#cueNext').classList.remove('hidden');
     const questions = (state.plan && state.plan.questions) || [];
     if (!questions.length) {
       card.classList.add('hidden');
@@ -750,6 +805,7 @@
     $('#btnRetry').classList.add('hidden');
     pendingBubble.candidate = null;
     pendingBubble.interviewer = null;
+    pendingBubble.coach = null;
     localTranscript = [];
     assistantBuf = '';
     state.sessionReady = false;
@@ -760,7 +816,7 @@
   let turnCount = 0;
   let localTranscript = [];
   let assistantBuf = '';
-  const pendingBubble = { candidate: null, interviewer: null };
+  const pendingBubble = { candidate: null, interviewer: null, coach: null };
 
   function messagesEl() {
     return $('#messages');
@@ -780,7 +836,7 @@
     if (!wrap) {
       wrap = document.createElement('div');
       wrap.className = `msg ${role} pending`;
-      wrap.innerHTML = `<div class="who">${role === 'candidate' ? '你' : '面试官'}</div><div class="bubble"></div>`;
+      wrap.innerHTML = `<div class="who">${ROLE_LABEL[role] || role}</div><div class="bubble"></div>`;
       el.appendChild(wrap);
       pendingBubble[role] = wrap;
     }
@@ -801,7 +857,18 @@
       if (text) node.querySelector('.bubble').textContent = text;
       node.classList.remove('pending');
       pendingBubble[role] = null;
-      if (finalText.trim()) localTranscript.push({ role, text: finalText.trim() });
+      if (finalText.trim()) {
+        const log = state.mode === 'coach' && state.coach ? state.coach.transcript : localTranscript;
+        log.push({ role, text: finalText.trim() });
+        // 面试中你的每段回答旁边都可以直接叫教练
+        if (role === 'candidate' && state.mode === 'interview') {
+          const btn = document.createElement('button');
+          btn.className = 'bubble-coach';
+          btn.dataset.idx = String(localTranscript.length - 1);
+          btn.textContent = '这段没答好，找教练';
+          node.appendChild(btn);
+        }
+      }
       turnCount += 1;
       $('#turnCount').textContent = `${turnCount} 轮`;
     }
@@ -824,15 +891,19 @@
     $('#btnRetry').classList.remove('hidden');
   }
 
-  function connectSocket() {
+  function connectSocket(params = {}) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws?sid=${encodeURIComponent(state.sid)}`);
+    const query = new URLSearchParams({ sid: state.sid, mode: state.mode });
+    if (params.cid) query.set('cid', params.cid);
+    if (params.resume) query.set('resume', params.resume);
+    state.lastParams = params;
+    const ws = new WebSocket(`${proto}://${location.host}/ws?${query}`);
     state.ws = ws;
     state.sessionReady = false;
 
     ws.onopen = () => {
       setStatus('建立连接', 'busy');
-      setLiveState('正在连接面试官…');
+      setLiveState(state.mode === 'coach' ? '正在连接教练…' : '正在连接面试官…');
       clearTimeout(state.connectTimer);
       state.connectTimer = setTimeout(() => {
         if (!state.sessionReady) {
@@ -848,16 +919,38 @@
     };
 
     ws.onerror = () => {
+      if (ws !== state.ws || ws.intentional) return;
       if (!state.ending) showLiveError('连接出错，请检查后端是否在运行。');
     };
 
     ws.onclose = () => {
+      // 切换面试官 / 教练时会主动关掉旧连接，不算出错
+      if (ws !== state.ws || ws.intentional) return;
       state.sending = false;
       clearTimeout(state.connectTimer);
       if (!state.ending) {
         showLiveError(state.sessionReady ? '连接已断开，请点「重新连接」。' : '无法连接到后端语音服务，请重试。');
       }
     };
+  }
+
+  // 主动结束当前语音连接（切换角色、结束练习时用）
+  function closeSocket() {
+    const ws = state.ws;
+    state.sending = false;
+    state.sessionReady = false;
+    clearTimeout(state.connectTimer);
+    AudioCtl.flush();
+    AudioCtl.speaking = false;
+    if (!ws) return;
+    ws.intentional = true;
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: 'session.close' })); } catch (_) { /* ignore */ }
+    }
+    setTimeout(() => {
+      try { ws.close(); } catch (_) { /* ignore */ }
+    }, 300);
+    state.ws = null;
   }
 
   function handleEvent(evt) {
@@ -874,17 +967,27 @@
         clearTimeout(state.connectTimer);
         $('#btnRetry').classList.add('hidden');
         state.sending = true;
-        setStatus('面试中', 'live');
-        setLiveState('面试官正在开口…');
-        $('#stageTip').textContent = '请开始你的自我介绍';
+        if (state.muted) sendJson({ type: 'input_audio_mute.commit' });
+        if (state.mode === 'coach') {
+          setStatus('教练练习', 'live');
+          setLiveState('教练正在开口…');
+          $('#stageTip').textContent = '不用紧张，这里是练习。卡住了可以说「给我提示」或「给我示范」';
+        } else {
+          state.interviewStarted = true;
+          setStatus('面试中', 'live');
+          setLiveState('面试官正在开口…');
+          $('#stageTip').textContent = '觉得哪段没答好，点「叫教练」或字幕里的「找教练」';
+        }
         startTimer();
         startMicWatch();
-        // 开场白由后端直接合成语音，不会产生 text 事件，这里按方案补一条字幕
-        const opening = state.plan && state.plan.opening;
-        if (opening) {
-          upsertBubble('interviewer', opening);
-          finalizeBubble('interviewer', opening);
-        }
+        break;
+      }
+
+      // 开场白由后端直接 TTS 合成，不会产生 text 事件，后端单独发这条用来显示字幕
+      case 'local.opening': {
+        const role = evt.role === 'coach' ? 'coach' : 'interviewer';
+        upsertBubble(role, evt.text || '');
+        finalizeBubble(role, evt.text || '');
         break;
       }
 
@@ -906,17 +1009,17 @@
       case 'response.output_text.delta':
         // 模型回复的 text delta 是增量片段，需要累积
         assistantBuf += pickText(evt, 'delta', 'text');
-        upsertBubble('interviewer', assistantBuf);
+        upsertBubble(assistantRole(), assistantBuf);
         break;
 
       case 'response.output_text.done':
-        finalizeBubble('interviewer', pickText(evt, 'text') || assistantBuf);
+        finalizeBubble(assistantRole(), pickText(evt, 'text') || assistantBuf);
         assistantBuf = '';
         break;
 
       case 'response.output_audio.started':
         AudioCtl.speaking = true;
-        setLiveState('面试官正在说话');
+        setLiveState(state.mode === 'coach' ? '教练正在说话' : '面试官正在说话');
         break;
 
       case 'response.output_audio.delta': {
@@ -1037,10 +1140,15 @@
     btn.disabled = true;
     AudioCtl.unlock(); // 必须在第一个 await 之前
     state.cueIndex = 0;
+    setMode('interview');
+    state.coachOnly = false;
+    state.coach = null;
+    state.interviewStarted = false;
 
     showView('live');
     resetTranscript();
     renderCue();
+    updateControls();
     setStatus('准备中', 'busy');
     setLiveState('等待麦克风授权…');
     $('#stageTip').textContent = '浏览器如弹出麦克风授权，请点「允许」';
@@ -1053,27 +1161,244 @@
   }
 
   async function retryConnection() {
-    if (state.ws) {
-      try { state.ws.close(); } catch (_) { /* ignore */ }
-      state.ws = null;
-    }
-    clearTimeout(state.connectTimer);
+    closeSocket();
     AudioCtl.stopAll();
     AudioCtl.unlock(); // 必须在第一个 await 之前
     $('#btnRetry').classList.add('hidden');
 
     showView('live');
-    resetTranscript();
     renderCue();
     setStatus('准备中', 'busy');
     setLiveState('等待麦克风授权…');
-    $('#stageTip').textContent = '浏览器如弹出麦克风授权，请点「允许」';
 
     if (!(await initAudio())) return;
 
     state.ending = false;
-    connectSocket();
+    if (state.mode === 'coach' && state.coach) {
+      connectSocket({ cid: state.coach.id });
+    } else {
+      connectSocket({ resume: state.interviewStarted ? 'next' : '' });
+    }
     startOrb();
+  }
+
+  /* ============================================================
+   * 教练模式
+   * ============================================================ */
+
+  function setMode(mode) {
+    state.mode = mode;
+    $('.stage').classList.toggle('coach', mode === 'coach');
+    $('#stageName').textContent = mode === 'coach' ? '教练' : '面试官';
+    updateControls();
+    renderCue();
+  }
+
+  function updateControls() {
+    const coach = state.mode === 'coach';
+    const ended = !!(state.coach && state.coach.ended);
+    const show = (id, on) => $(id).classList.toggle('hidden', !on);
+    show('#btnMic', !ended);
+    show('#btnCoach', !coach);
+    show('#btnEnd', !coach);
+    show('#btnBackRetry', coach && !state.coachOnly);
+    show('#btnBackNext', coach && !state.coachOnly);
+    show('#btnEndCoach', coach && state.coachOnly && !ended);
+    show('#btnCoachAgain', coach && state.coachOnly && ended);
+    show('#btnCoachReturn', coach && state.coachOnly && ended);
+  }
+
+  function addDivider(text) {
+    const el = messagesEl();
+    const empty = el.querySelector('.empty-hint');
+    if (empty) empty.remove();
+    const div = document.createElement('div');
+    div.className = 'msg-divider';
+    div.textContent = text;
+    el.appendChild(div);
+    scrollMessages();
+  }
+
+  // 从面试字幕里找出「第 idx 段回答」对应的问题和完整回答
+  function answerAt(idx) {
+    let qIdx = -1;
+    for (let i = idx; i >= 0; i--) {
+      if (localTranscript[i].role === 'interviewer') { qIdx = i; break; }
+    }
+    const parts = [];
+    for (let i = qIdx + 1; i < localTranscript.length; i++) {
+      if (localTranscript[i].role === 'interviewer') break;
+      parts.push(localTranscript[i].text);
+    }
+    return {
+      question: qIdx >= 0 ? localTranscript[qIdx].text : '自我介绍',
+      answer: parts.join(' '),
+    };
+  }
+
+  function lastAnswerIdx() {
+    for (let i = localTranscript.length - 1; i >= 0; i--) {
+      if (localTranscript[i].role === 'candidate') return i;
+    }
+    return -1;
+  }
+
+  async function createCoach(payload) {
+    const res = await fetch(`/api/session/${encodeURIComponent(state.sid)}/coach`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '教练备课失败');
+    return data;
+  }
+
+  function currentQid() {
+    const questions = (state.plan && state.plan.questions) || [];
+    const q = questions[state.cueIndex];
+    return q && Number.isFinite(Number(q.id)) ? Number(q.id) : null;
+  }
+
+  // 面试中途叫教练：idx 不传时取最近一段回答
+  async function coachFromInterview(idx) {
+    if (state.mode === 'coach' || state.switching) return;
+    const at = Number.isInteger(idx) ? idx : lastAnswerIdx();
+    if (at < 0) {
+      setLiveState('还没有你的回答。先答一题，觉得不好再叫教练');
+      return;
+    }
+    const { question, answer } = answerAt(at);
+    state.switching = true;
+    closeSocket();
+    setMode('coach');
+    state.coachOnly = false;
+    addDivider(`教练时间 · ${question.length > 24 ? question.slice(0, 24) + '…' : question}`);
+    setStatus('教练备课', 'busy');
+    setLiveState('教练正在看你刚才的回答…');
+    try {
+      const data = await createCoach({ question, answer, qid: currentQid(), source: 'interview' });
+      state.coach = { id: data.coach_id, brief: data.brief, question, answer, transcript: [], ended: false };
+      renderCue();
+      if (data.warning) addDivider(data.warning);
+      connectSocket({ cid: data.coach_id });
+    } catch (err) {
+      addDivider(`叫教练失败：${err.message}`);
+      setMode('interview');
+      connectSocket({ resume: 'retry' });
+    } finally {
+      state.switching = false;
+    }
+  }
+
+  // 从教练回到面试：retry 重答这题，next 进入下一题
+  function backToInterview(action) {
+    if (state.mode !== 'coach' || !state.coach || state.switching) return;
+    const coach = state.coach;
+    closeSocket();
+    summarizeCoach(coach);
+    setMode('interview');
+    if (action === 'next') moveCue(1);
+    addDivider(action === 'next' ? '回到面试 · 下一题' : '回到面试 · 重答这题');
+    connectSocket({ cid: coach.id, resume: action });
+  }
+
+  // 从方案页 / 报告页单独练一题。必须在点击事件里同步调用（音频解锁）
+  async function startCoachPractice({ question, answer = '', qid = null, source = 'plan' }) {
+    if (!state.sid || !question) return;
+    AudioCtl.unlock();
+    state.coachReturnView = state.view;
+    state.coachOnly = true;
+    state.coach = null;
+    state.ending = false;
+    if (qid !== null) {
+      const idx = ((state.plan && state.plan.questions) || []).findIndex((q) => String(q.id) === String(qid));
+      if (idx >= 0) state.cueIndex = idx;
+    }
+    showView('live');
+    resetTranscript();
+    setMode('coach');
+    addDivider(`教练练习 · ${question.length > 24 ? question.slice(0, 24) + '…' : question}`);
+    setStatus('教练备课', 'busy');
+    setLiveState('等待麦克风授权…');
+    startOrb();
+
+    if (!(await initAudio())) return;
+    setLiveState('教练正在备课…');
+    try {
+      const data = await createCoach({ question, answer, qid, source });
+      state.coach = { id: data.coach_id, brief: data.brief, question, answer, qid, source, transcript: [], ended: false };
+      renderCue();
+      if (data.warning) addDivider(data.warning);
+      connectSocket({ cid: data.coach_id });
+    } catch (err) {
+      showLiveError(`教练备课失败：${err.message}`);
+    }
+  }
+
+  function endCoachPractice() {
+    if (!state.coach) return;
+    closeSocket();
+    stopTimer();
+    stopMicWatch();
+    AudioCtl.stopAll();
+    state.coach.ended = true;
+    setStatus('练习结束', '');
+    setLiveState('练习结束');
+    updateControls();
+    summarizeCoach(state.coach);
+  }
+
+  function againCoachPractice() {
+    const c = state.coach;
+    if (!c) return;
+    startCoachPractice({ question: c.question, answer: c.answer, qid: c.qid ?? null, source: c.source || 'plan' });
+  }
+
+  function returnFromCoach() {
+    state.coach = null;
+    state.coachOnly = false;
+    setMode('interview');
+    setStatus(state.coachReturnView === 'report' ? '已完成' : '方案已生成', '');
+    $('#timer').textContent = '00:00';
+    showView(state.coachReturnView || 'plan');
+  }
+
+  async function summarizeCoach(coach) {
+    const card = document.createElement('div');
+    card.className = 'coach-summary';
+    card.innerHTML = '<div class="cs-title">练习小结</div><div class="hint">正在整理这次练习…</div>';
+    messagesEl().appendChild(card);
+    scrollMessages();
+    try {
+      const res = await fetch(
+        `/api/session/${encodeURIComponent(state.sid)}/coach/${encodeURIComponent(coach.id)}/summary`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transcript: coach.transcript }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '生成失败');
+      coach.summary = data.summary;
+      card.innerHTML = data.summary
+        ? renderCoachSummary(coach.question, data.summary)
+        : `<div class="cs-title">练习小结</div><div class="hint">${esc(data.warning || '没有生成小结')}</div>`;
+    } catch (err) {
+      card.innerHTML = `<div class="cs-title">练习小结</div><div class="hint">生成失败：${esc(err.message)}</div>`;
+    }
+    scrollMessages();
+  }
+
+  function renderCoachSummary(question, sum) {
+    return `
+      <div class="cs-title">练习小结</div>
+      <div class="cs-q">${esc(question)}</div>
+      ${sum.progress ? `<p>${esc(sum.progress)}</p>` : ''}
+      ${(sum.takeaways || []).length ? `<h4>记住这几点</h4><ul>${sum.takeaways.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}
+      ${sum.improved_answer ? `<h4>练完后的版本</h4><div class="better">${esc(sum.improved_answer)}</div>` : ''}
+      ${(sum.still_missing || []).length ? `<h4>课后补充</h4><ul class="ol-need">${sum.still_missing.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}`;
   }
 
   function toggleMic() {
@@ -1150,7 +1475,32 @@
 
     body.innerHTML = renderReport(data.report || {});
     bindAgain();
+    loadCoachHistory();
     setStatus('已完成', '');
+  }
+
+  async function fetchCoaching() {
+    try {
+      const res = await fetch(`/api/session/${encodeURIComponent(state.sid)}/coaching`);
+      if (!res.ok) return [];
+      return (await res.json()).items || [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async function loadCoachHistory() {
+    const items = (await fetchCoaching()).filter((c) => c.summary || (c.transcript || []).length > 1);
+    const box = $('#coachHistory');
+    if (!box || !items.length) return;
+    box.innerHTML = `<div class="card-title">教练练习记录 · ${items.length} 次</div>${items
+      .map((c) =>
+        c.summary
+          ? `<div class="coach-summary">${renderCoachSummary(c.question, c.summary)}</div>`
+          : `<div class="coach-summary"><div class="cs-q">${esc(c.question)}</div><div class="hint">练习了 ${c.transcript.length} 轮，没有生成小结</div></div>`
+      )
+      .join('')}`;
+    box.classList.remove('hidden');
   }
 
   function renderReport(report) {
@@ -1192,6 +1542,7 @@
               ${q.what_to_improve ? `<h4>问题在哪</h4><p>${esc(q.what_to_improve)}</p>` : ''}
               ${q.framework || q.structure_check ? `<h4>结构对照${q.framework ? ` · ${esc(q.framework)}` : ''}</h4><p>${esc(q.structure_check || '')}</p>` : ''}
               ${q.better_answer ? `<h4>可以这样说${q.framework ? '（按这个结构）' : ''}</h4><div class="better">${esc(q.better_answer)}</div>` : ''}
+              <button class="ghost coach-btn" data-question="${esc(q.question)}" data-answer="${esc(q.answer_summary || '')}">和教练练这题</button>
             </div>
           </details>`;
       })
@@ -1248,6 +1599,8 @@
         </div>
       </div>
 
+      <div class="card report-card hidden" id="coachHistory" style="margin-bottom:22px"></div>
+
       <div class="report-actions">
         <button class="ghost" id="btnDownload">下载 Markdown</button>
         <button class="primary" id="btnAgain">再来一场</button>
@@ -1292,7 +1645,19 @@
       const res = await fetch(`/api/session/${state.sid}`);
       const session = await res.json();
       const report = session.report || {};
-      downloadText(toMarkdown(report), `面试复盘-${state.sid}.md`);
+      const coaching = (await fetchCoaching()).filter((c) => c.summary);
+      let md = toMarkdown(report);
+      if (coaching.length) {
+        md += '\n\n## 教练练习记录\n';
+        coaching.forEach((c) => {
+          const sum = c.summary;
+          md += `\n### ${c.question}\n`;
+          if (sum.progress) md += `\n${sum.progress}\n`;
+          (sum.takeaways || []).forEach((t) => { md += `- ${t}\n`; });
+          if (sum.improved_answer) md += `\n> 练完后的版本：${sum.improved_answer}\n`;
+        });
+      }
+      downloadText(md, `面试复盘-${state.sid}.md`);
     } catch (err) {
       console.warn(err);
     }
@@ -1341,10 +1706,7 @@
   }
 
   function resetToSetup() {
-    if (state.ws) {
-      try { state.ws.close(); } catch (_) { /* ignore */ }
-      state.ws = null;
-    }
+    closeSocket();
     AudioCtl.stopAll();
     stopTimer();
     stopMicWatch();
@@ -1352,6 +1714,10 @@
     state.sid = null;
     state.outlines = null;
     state.cueIndex = 0;
+    state.coach = null;
+    state.coachOnly = false;
+    state.interviewStarted = false;
+    setMode('interview');
     state.ending = false;
     state.sessionReady = false;
     state.duration = 0;
@@ -1400,6 +1766,8 @@
     // 你说话时用麦克风音量驱动声波球，面试官说话时保持原来的效果
     const level = Math.min(1, Math.max(AudioCtl.level * 7, m.ratio * 0.8) + (AudioCtl.speaking ? 0.16 : 0));
     const speaking = AudioCtl.speaking;
+    // 面试官说话是琥珀色，教练说话是青色
+    const tone = state.mode === 'coach' ? '95, 227, 200' : '245, 185, 98';
 
     const bar = $('#micBar');
     if (bar) bar.style.width = `${Math.round(m.ratio * 100)}%`;
@@ -1425,7 +1793,7 @@
       const radius = w * 0.17 + ring * 26 + Math.sin(phase * 1.1 - ring * 0.7) * 7 + level * 26 * (4 - ring) / 3;
       ctx2d.beginPath();
       ctx2d.arc(cx, cx, radius, 0, Math.PI * 2);
-      ctx2d.strokeStyle = `rgba(245, 185, 98, ${0.05 + ring * 0.035})`;
+      ctx2d.strokeStyle = `rgba(${tone}, ${0.05 + ring * 0.035})`;
       ctx2d.lineWidth = 1.1;
       ctx2d.stroke();
     }
@@ -1457,7 +1825,7 @@
       ctx2d.moveTo(x1, y1);
       ctx2d.lineTo(x2, y2);
       ctx2d.strokeStyle = speaking
-        ? `rgba(245, 185, 98, ${0.28 + wave * 0.4})`
+        ? `rgba(${tone}, ${0.28 + wave * 0.4})`
         : `rgba(95, 227, 200, ${0.18 + wave * 0.32})`;
       ctx2d.lineWidth = 2;
       ctx2d.lineCap = 'round';
@@ -1494,6 +1862,7 @@
       body.classList.remove('hidden');
       body.innerHTML = renderReport(session.report);
       bindAgain();
+      loadCoachHistory();
       showView('report');
       setStatus('已完成', '');
     } catch (err) {
@@ -1514,6 +1883,27 @@
   $('#btnReloadMethods').addEventListener('click', loadMethods);
   $('#btnRegenOutlines').addEventListener('click', () => loadOutlines(true));
   $('#btnDownloadCards').addEventListener('click', () => downloadText(cardsMarkdown(), `答题卡-${state.sid}.md`));
+  $('#btnCoach').addEventListener('click', () => coachFromInterview());
+  $('#btnBackRetry').addEventListener('click', () => backToInterview('retry'));
+  $('#btnBackNext').addEventListener('click', () => backToInterview('next'));
+  $('#btnEndCoach').addEventListener('click', endCoachPractice);
+  $('#btnCoachAgain').addEventListener('click', againCoachPractice);
+  $('#btnCoachReturn').addEventListener('click', returnFromCoach);
+  $('#messages').addEventListener('click', (event) => {
+    const btn = event.target.closest('.bubble-coach');
+    if (btn) coachFromInterview(Number(btn.dataset.idx));
+  });
+  $('#questionList').addEventListener('click', (event) => {
+    const btn = event.target.closest('.coach-btn');
+    if (!btn) return;
+    const q = ((state.plan && state.plan.questions) || [])[Number(btn.dataset.qidx)];
+    if (q) startCoachPractice({ question: q.question, qid: q.id ?? null, source: 'plan' });
+  });
+  $('#reportBody').addEventListener('click', (event) => {
+    const btn = event.target.closest('.coach-btn');
+    if (!btn) return;
+    startCoachPractice({ question: btn.dataset.question, answer: btn.dataset.answer || '', source: 'report' });
+  });
   $('#cuePrev').addEventListener('click', () => moveCue(-1));
   $('#cueNext').addEventListener('click', () => moveCue(1));
   $('#cueToggle').addEventListener('click', () => {

@@ -36,14 +36,7 @@ HOTWORDS = [
 ]
 
 
-def build_session_create(session: Dict[str, Any]) -> Dict[str, Any]:
-    plan = session.get("plan") or {}
-    instructions = prompts.build_interviewer_instructions(
-        plan,
-        role=session.get("role", ""),
-        level=session.get("level", ""),
-        company=session.get("company", ""),
-    )
+def build_session_create(instructions: str) -> Dict[str, Any]:
     return {
         "type": "session.create",
         "session": {
@@ -98,8 +91,9 @@ class TranscriptTracker:
     优先取 completed/done 事件里的完整文本，取不到就用 delta 累积。
     """
 
-    def __init__(self, session: Dict[str, Any]) -> None:
+    def __init__(self, session: Dict[str, Any], assistant_role: str = "interviewer") -> None:
         self.session = session
+        self.assistant_role = assistant_role
         self._user_buf = ""
         self._assistant_buf = ""
 
@@ -117,7 +111,7 @@ class TranscriptTracker:
         elif etype == "response.output_text.done":
             text = _str_field(evt, "text", "transcript") or self._assistant_buf
             self._assistant_buf = ""
-            store.append_turn(self.session, "interviewer", text)
+            store.append_turn(self.session, self.assistant_role, text)
         elif etype == "error":
             log.warning("downstream error: %s", json.dumps(evt, ensure_ascii=False)[:500])
 
@@ -130,11 +124,85 @@ async def _safe_send(ws: WebSocket, raw: str) -> bool:
         return False
 
 
-async def proxy(ws: WebSocket, sid: str) -> None:
+def _interviewer_instructions(session: Dict[str, Any]) -> str:
+    return prompts.build_interviewer_instructions(
+        session.get("plan") or {},
+        role=session.get("role", ""),
+        level=session.get("level", ""),
+        company=session.get("company", ""),
+    )
+
+
+def _next_question(plan: Dict[str, Any], qid: Any) -> Optional[Dict[str, Any]]:
+    questions = plan.get("questions") or []
+    for i, q in enumerate(questions):
+        if qid is not None and str(q.get("id")) == str(qid):
+            return questions[i + 1] if i + 1 < len(questions) else None
+    return None
+
+
+def resolve_persona(
+    session: Dict[str, Any], mode: str, cid: str, resume: str
+) -> Optional[Dict[str, Any]]:
+    """决定这条连接是谁在说话：面试官 / 教练 / 从教练回来的面试官。
+
+    返回 instructions、开场白、逐字稿写到哪里、怎么保存。
+    """
+    if mode == "coach":
+        record = store.get_coaching(session["id"], cid)
+        if not record:
+            return None
+        return {
+            "instructions": prompts.build_coach_instructions(record, session),
+            "opening": (record.get("brief") or {}).get("opening") or "好，我们来练这道题。你先试着答一遍。",
+            "target": record,
+            "save": store.save_coaching,
+            "role": "coach",
+        }
+
+    instructions = _interviewer_instructions(session)
+    opening = (session.get("plan") or {}).get("opening") or "你好，我们先从自我介绍开始吧。"
+
+    if resume:
+        record = store.get_coaching(session["id"], cid) if cid else None
+        history = "\n".join(
+            ("面试官" if t["role"] == "interviewer" else "候选人") + "：" + t["text"][:300]
+            for t in session.get("transcript", [])[-10:]
+        )
+        if resume == "retry" and record:
+            # 不复读原问题：面试官原话常带「嗯，我理解」之类的承接，念出来很别扭
+            opening = "好，我们回到刚才那道题，你再完整回答一次吧。"
+        else:
+            nxt = _next_question(session.get("plan") or {}, (record or {}).get("qid"))
+            opening = (
+                f"好，我们继续。{nxt['question']}"
+                if nxt
+                else "好，我们继续。你准备好了就说一声，我问下一个问题。"
+            )
+        instructions += prompts.build_resume_note(history, "retry" if resume == "retry" and record else "next")
+
+    return {
+        "instructions": instructions,
+        "opening": opening,
+        "target": session,
+        "save": store.save_session,
+        "role": "interviewer",
+    }
+
+
+async def proxy(ws: WebSocket, sid: str, mode: str = "interview", cid: str = "", resume: str = "") -> None:
     session: Optional[Dict[str, Any]] = store.get_session(sid)
     if not session:
         await ws.close(code=4404, reason="session not found")
         return
+
+    persona = resolve_persona(session, mode, cid, resume)
+    if not persona:
+        await ws.send_json({"type": "local.error", "message": "教练练习记录不存在，请重新发起。"})
+        await ws.close()
+        return
+    target: Dict[str, Any] = persona["target"]
+    save = persona["save"]
 
     if not settings.volc_api_key:
         await ws.send_json(
@@ -169,9 +237,9 @@ async def proxy(ws: WebSocket, sid: str) -> None:
 
     try:
         await upstream.send(
-            json.dumps(build_session_create(session), ensure_ascii=False)
+            json.dumps(build_session_create(persona["instructions"]), ensure_ascii=False)
         )
-        log.info("session.create sent session=%s", sid)
+        log.info("session.create sent session=%s mode=%s resume=%s", sid, mode, resume or "-")
     except Exception as exc:
         log.exception("send session.create failed")
         await ws.send_json({"type": "local.error", "message": f"创建会话失败：{exc}"})
@@ -179,7 +247,7 @@ async def proxy(ws: WebSocket, sid: str) -> None:
         await ws.close()
         return
 
-    tracker = TranscriptTracker(session)
+    tracker = TranscriptTracker(target, persona["role"])
     greeting_sent = False
     closed_by_client = False
     audio_frames = 0
@@ -215,7 +283,12 @@ async def proxy(ws: WebSocket, sid: str) -> None:
                 log.info("downlink %s", json.dumps(evt, ensure_ascii=False)[:240])
             if etype == "session.created" and not greeting_sent:
                 greeting_sent = True
-                opening = (session.get("plan") or {}).get("opening") or "你好，我们先从自我介绍开始吧。"
+                opening = persona["opening"]
+                # 开场白是直接 TTS 合成的，不会产生 text 事件：告诉前端显示字幕，并记进逐字稿
+                await _safe_send(ws, json.dumps(
+                    {"type": "local.opening", "role": persona["role"], "text": opening}, ensure_ascii=False
+                ))
+                store.append_turn(target, persona["role"], opening)
                 await upstream.send(
                     json.dumps(
                         {"type": "speech_text_buffer.commit", "text": opening},
@@ -228,7 +301,7 @@ async def proxy(ws: WebSocket, sid: str) -> None:
             tracker.feed(evt)
 
             if etype in {"session.closed", "session.finished"}:
-                store.save_session(session)
+                save(target)
                 break
 
     t1 = asyncio.create_task(client_to_upstream())
@@ -242,7 +315,7 @@ async def proxy(ws: WebSocket, sid: str) -> None:
             if exc and not isinstance(exc, (WebSocketDisconnect, asyncio.CancelledError)):
                 log.warning("pump ended with %r", exc)
     finally:
-        store.save_session(session)
+        save(target)
         try:
             if not closed_by_client and upstream.state.name == "OPEN":
                 await upstream.send(json.dumps({"type": "session.close"}))
@@ -254,4 +327,4 @@ async def proxy(ws: WebSocket, sid: str) -> None:
             await ws.close()
         except Exception:
             pass
-        log.info("proxy closed session=%s turns=%d", sid, len(session["transcript"]))
+        log.info("proxy closed session=%s mode=%s turns=%d", sid, mode, len(target["transcript"]))

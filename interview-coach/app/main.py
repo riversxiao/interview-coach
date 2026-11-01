@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import methods, realtime, store
-from .brain import brain, default_plan, static_outlines
+from .brain import brain, default_plan, static_coach_brief, static_outlines
 from .config import WEB_DIR, settings
 
 logging.basicConfig(
@@ -48,6 +48,18 @@ class PrepareRequest(BaseModel):
 
 class MethodsRequest(BaseModel):
     text: str = Field(..., max_length=200000)
+
+
+class CoachRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    answer: str = Field(default="", max_length=8000)
+    qid: Optional[int] = None
+    # interview：面试中途叫教练；plan / report：从方案页或报告页单独练一题
+    source: str = Field(default="plan", pattern="^(interview|plan|report)$")
+
+
+class CoachSummaryRequest(BaseModel):
+    transcript: list[dict] = Field(default_factory=list)
 
 
 class ReportRequest(BaseModel):
@@ -198,6 +210,74 @@ async def build_outlines(sid: str, refresh: bool = False) -> JSONResponse:
     return JSONResponse(result)
 
 
+@app.post("/api/session/{sid}/coach")
+async def create_coach(sid: str, req: CoachRequest) -> JSONResponse:
+    """开一次教练练习：先由分析脑写备课单，前端再用 cid 连 /ws?mode=coach。"""
+    session = store.get_session(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    plan = session.get("plan") or {}
+    warning: Optional[str] = None
+    if brain.ready:
+        try:
+            brief = await brain.build_coach_brief(session, req.question, req.answer, req.qid)
+        except Exception as exc:
+            logging.exception("build coach brief failed")
+            brief = static_coach_brief(plan, req.qid, req.answer)
+            warning = f"教练备课失败，先用通用引导：{exc}"
+    else:
+        brief = static_coach_brief(plan, req.qid, req.answer)
+        warning = "未配置 BRAIN_API_KEY，教练只能按通用结构引导，不会针对你的回答做诊断。"
+
+    record = store.create_coaching(
+        sid,
+        {"question": req.question.strip(), "answer": req.answer.strip(), "qid": req.qid,
+         "source": req.source, "brief": brief},
+    )
+    return JSONResponse({"coach_id": record["id"], "brief": brief, "warning": warning})
+
+
+@app.post("/api/session/{sid}/coach/{cid}/summary")
+async def coach_summary(sid: str, cid: str, req: CoachSummaryRequest) -> JSONResponse:
+    record = store.get_coaching(sid, cid)
+    session = store.get_session(sid)
+    if not record or not session:
+        raise HTTPException(status_code=404, detail="练习记录不存在")
+
+    if not record["transcript"] and req.transcript:
+        for item in req.transcript:
+            role = item.get("role") if isinstance(item, dict) else ""
+            text = item.get("text") if isinstance(item, dict) else ""
+            if role in {"candidate", "coach"} and isinstance(text, str):
+                store.append_turn(record, role, text)
+        store.save_coaching(record)
+
+    if not any(t["role"] == "candidate" for t in record["transcript"]):
+        return JSONResponse({"summary": None, "warning": "这次练习里还没有你的发言，没有生成小结。"})
+    if not brain.ready:
+        return JSONResponse({"summary": None, "warning": "未配置 BRAIN_API_KEY，无法生成练习小结。"})
+
+    try:
+        summary = await brain.build_coach_summary(
+            record, store.transcript_text(record), session.get("materials") or session.get("resume") or ""
+        )
+    except Exception as exc:
+        logging.exception("coach summary failed")
+        raise HTTPException(status_code=502, detail=f"生成小结失败：{exc}") from exc
+
+    record["summary"] = summary
+    store.save_coaching(record)
+    return JSONResponse({"summary": summary})
+
+
+@app.get("/api/session/{sid}/coaching")
+async def list_coaching(sid: str) -> JSONResponse:
+    if not store.get_session(sid):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return JSONResponse({"items": store.list_coaching(sid)})
+
+
 @app.get("/api/session/{sid}")
 async def get_session(sid: str) -> JSONResponse:
     session = store.get_session(sid)
@@ -256,9 +336,15 @@ async def build_report(sid: str, req: ReportRequest) -> JSONResponse:
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
-    sid = ws.query_params.get("sid", "")
+    params = ws.query_params
+    sid = params.get("sid", "")
+    mode = params.get("mode", "interview")
+    resume = params.get("resume", "")
     await ws.accept()
-    await realtime.proxy(ws, sid)
+    if mode not in {"interview", "coach"} or resume not in {"", "retry", "next"}:
+        await ws.close(code=4400, reason="bad params")
+        return
+    await realtime.proxy(ws, sid, mode=mode, cid=params.get("cid", ""), resume=resume)
 
 
 if __name__ == "__main__":

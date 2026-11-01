@@ -169,6 +169,46 @@ class Brain:
         )
         return normalize_outlines(data.get("outlines") or [], plan, parsed["frameworks"])
 
+    async def build_coach_brief(
+        self,
+        session: Dict[str, Any],
+        question: str,
+        answer: str,
+        qid_hint: Any = None,
+    ) -> Dict[str, Any]:
+        plan = session.get("plan") or {}
+        fallback = static_coach_brief(plan, qid_hint, answer)
+        raw = await self._json(
+            prompts.COACH_BRIEF_SYSTEM,
+            prompts.build_coach_brief_user(
+                methods.prompt_text(methods.load()),
+                plan,
+                (session.get("outlines") or {}).get("items") or [],
+                session.get("resume", ""),
+                session.get("materials", ""),
+                question,
+                answer,
+                qid_hint,
+            ),
+            settings.brain_model,
+        )
+        return _normalize_brief(raw, fallback)
+
+    async def build_coach_summary(
+        self, record: Dict[str, Any], transcript_text: str, materials: str = ""
+    ) -> Dict[str, Any]:
+        raw = await self._json(
+            prompts.COACH_SUMMARY_SYSTEM,
+            prompts.build_coach_summary_user(record, transcript_text, materials),
+            settings.brain_model,
+        )
+        return {
+            "improved_answer": str(raw.get("improved_answer") or "").strip(),
+            "takeaways": _str_list(raw.get("takeaways"), 4),
+            "still_missing": _str_list(raw.get("still_missing"), 5),
+            "progress": str(raw.get("progress") or "").strip(),
+        }
+
     async def build_report(
         self,
         plan: Dict[str, Any],
@@ -304,6 +344,69 @@ def normalize_outlines(
             }
         )
     return result
+
+
+def _find_question(plan: Dict[str, Any], qid: Any) -> Optional[Dict[str, Any]]:
+    for q in plan.get("questions", []):
+        if qid is not None and str(q.get("id")) == str(qid):
+            return q
+    return None
+
+
+def static_coach_brief(plan: Dict[str, Any], qid: Any, answer: str) -> Dict[str, Any]:
+    """没有分析脑时的备课单：按题型取框架，引导问题按骨架逐步问。"""
+    frameworks = methods.load()["frameworks"]
+    q = _find_question(plan, qid) or {}
+    fw = methods.pick_for_type(frameworks, q.get("type", "")) or {"name": "STAR", "steps": [], "mnemonic": ""}
+    has_answer = bool((answer or "").strip())
+    return {
+        "qid": q.get("id"),
+        "framework": fw["name"],
+        "mnemonic": fw.get("mnemonic", ""),
+        "steps": [{"label": s, "status": "todo", "note": ""} for s in fw.get("steps", [])],
+        "diagnosis": "",
+        "strength": "",
+        "guiding_questions": [f"「{s}」这一步，你会怎么讲？" for s in fw.get("steps", [])][:5],
+        "hints": [
+            "先想想面试官最想听到的结论是什么。",
+            f"按「{fw.get('mnemonic') or fw['name']}」的顺序，看看漏了哪一步。",
+            fw.get("opening") or "可以这样开头：结论是 XX，我讲一个 XX 的例子。",
+        ],
+        "target": "按结构讲完整，至少有一个数字和一个自己的判断",
+        "opening": (
+            "好，我们来练这题。你先说说，刚才自己觉得哪里没讲好？"
+            if has_answer
+            else "好，我们来练这题。你先用一两分钟试着答一遍，我听听。"
+        ),
+        "personalized": False,
+    }
+
+
+def _normalize_brief(raw: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    steps = []
+    for s in raw.get("steps") or []:
+        if isinstance(s, dict) and s.get("label"):
+            status = str(s.get("status") or "todo").strip()
+            steps.append({
+                "label": str(s["label"]).strip(),
+                "status": status if status in {"ok", "weak", "missing", "todo"} else "todo",
+                "note": str(s.get("note") or "").strip(),
+            })
+    names = {fw["name"] for fw in methods.load()["frameworks"]}
+    framework = str(raw.get("framework") or "").strip()
+    return {
+        "qid": raw.get("qid") if raw.get("qid") is not None else fallback.get("qid"),
+        "framework": framework if framework in names else fallback["framework"],
+        "mnemonic": str(raw.get("mnemonic") or fallback.get("mnemonic") or "").strip(),
+        "steps": steps or fallback["steps"],
+        "diagnosis": str(raw.get("diagnosis") or "").strip(),
+        "strength": str(raw.get("strength") or "").strip(),
+        "guiding_questions": _str_list(raw.get("guiding_questions"), 6) or fallback["guiding_questions"],
+        "hints": _str_list(raw.get("hints"), 3) or fallback["hints"],
+        "target": str(raw.get("target") or fallback["target"]).strip(),
+        "opening": str(raw.get("opening") or fallback["opening"]).strip(),
+        "personalized": True,
+    }
 
 
 def static_outlines(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
