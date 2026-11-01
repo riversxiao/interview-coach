@@ -27,6 +27,11 @@
     ending: false,
     sending: false,
     muted: false,
+    view: 'setup',
+    viewBeforeMethods: 'setup',
+    outlines: null,
+    cueIndex: 0,
+    cueHidden: false,
   };
 
   /* ============================================================
@@ -48,6 +53,21 @@
     speaking: false,
     muted: false,
     onFrame: null,
+    meterPeak: 0,
+
+    /**
+     * 必须在点击事件里「同步」调用（任何 await 之前）。
+     * Chrome / Safari 的自动播放策略要求 AudioContext 在用户手势内创建并 resume，
+     * 原来的写法是等 getUserMedia 授权弹窗结束后才 new AudioContext，此时手势已失效，
+     * Safari 下 context 会一直停在 suspended，worklet 和分析器都拿不到任何数据。
+     */
+    unlock() {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!this.micCtx || this.micCtx.state === 'closed') this.micCtx = new Ctx();
+      if (!this.playCtx || this.playCtx.state === 'closed') this.playCtx = new Ctx();
+      this.micCtx.resume().catch(() => {});
+      this.playCtx.resume().catch(() => {});
+    },
 
     async init(onFrame) {
       this.onFrame = onFrame;
@@ -55,6 +75,8 @@
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw Object.assign(new Error('当前页面无法使用麦克风'), { name: 'InsecureError' });
       }
+
+      this.unlock();
 
       this.stream = await requestMic({
         audio: {
@@ -65,8 +87,6 @@
         },
       });
 
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      this.micCtx = new Ctx();
       await this.micCtx.audioWorklet.addModule('/static/audio-worklet.js');
 
       const source = this.micCtx.createMediaStreamSource(this.stream);
@@ -91,15 +111,34 @@
         if (data.pcm && this.onFrame) this.onFrame(data.pcm);
       };
 
-      this.playCtx = new Ctx();
       this.gain = this.playCtx.createGain();
       this.gain.gain.value = 1;
       this.gain.connect(this.playCtx.destination);
     },
 
+    // resume 在没有用户手势时可能永远不 resolve，这里加超时，避免整个流程卡死在「等待麦克风授权」
     async resume() {
-      if (this.micCtx && this.micCtx.state !== 'running') await this.micCtx.resume();
-      if (this.playCtx && this.playCtx.state !== 'running') await this.playCtx.resume();
+      const tryResume = (ctx) => {
+        if (!ctx || ctx.state === 'running' || ctx.state === 'closed') return Promise.resolve();
+        return Promise.race([
+          ctx.resume().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]);
+      };
+      await Promise.all([tryResume(this.micCtx), tryResume(this.playCtx)]);
+    },
+
+    suspended() {
+      return [this.micCtx, this.playCtx].some((ctx) => ctx && ctx.state === 'suspended');
+    },
+
+    // 带峰值保持的音量（0-1，按 dB 映射）。原来直接用瞬时峰值 × 160，
+    // 正常说话音量只占 1-5%，4px 高的条几乎看不出来动
+    meter() {
+      const raw = this.rawPeak();
+      this.meterPeak = Math.max(raw, this.meterPeak * 0.92);
+      const db = 20 * Math.log10(this.meterPeak + 1e-6);
+      return { raw, peak: this.meterPeak, db, ratio: Math.max(0, Math.min(1, (db + 60) / 54)) };
     },
 
     setMuted(value) {
@@ -205,6 +244,10 @@
       });
       this.micCtx = null;
       this.playCtx = null;
+      this.analyser = null;
+      this._analyserBuf = null;
+      this.level = 0;
+      this.meterPeak = 0;
     },
   };
 
@@ -213,7 +256,8 @@
    * ============================================================ */
 
   function showView(name) {
-    ['setup', 'plan', 'live', 'report'].forEach((view) => {
+    state.view = name;
+    ['setup', 'plan', 'live', 'report', 'methods'].forEach((view) => {
       $(`#view-${view}`).classList.toggle('hidden', view !== name);
     });
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -360,10 +404,11 @@
       company: $('#company').value.trim(),
       jd: $('#jd').value.trim(),
       resume: $('#resume').value.trim(),
+      materials: $('#materials').value.trim(),
     };
 
-    if (!payload.jd && !payload.resume) {
-      errorBox.textContent = '至少提供 JD 或简历，否则问题会很泛。';
+    if (!payload.jd && !payload.resume && !payload.materials) {
+      errorBox.textContent = '至少提供 JD、简历或工作素材其中一项，否则问题会很泛。';
       return;
     }
 
@@ -422,10 +467,14 @@
           <div>
             <div class="q-text"><span class="q-type">${esc(TYPE_LABEL[q.type] || '问题')}</span>${esc(q.question)}</div>
             ${q.intent ? `<div class="q-meta">考察：${esc(q.intent)}</div>` : ''}
+            <div class="outline-slot" data-qid="${esc(q.id ?? index + 1)}"><div class="outline-loading">正在整理答题框架…</div></div>
           </div>
         </li>`
       )
       .join('');
+
+    state.outlines = null;
+    loadOutlines(false);
 
     const warning = $('#prepWarning');
     if (data.warning) {
@@ -457,6 +506,236 @@
     } catch (err) {
       $('#fileName').textContent = `解析失败：${err.message}`;
     }
+  }
+
+  /* ============================================================
+   * 答题框架（每道题：结构 + 你的素材 + 口诀）
+   * ============================================================ */
+
+  async function loadOutlines(refresh) {
+    if (!state.sid) return;
+    const sid = state.sid;
+    const status = $('#outlineStatus');
+    const warning = $('#outlineWarning');
+    $('#btnRegenOutlines').disabled = true;
+    $('#btnDownloadCards').disabled = true;
+    status.textContent = '生成中，约 20-40 秒…';
+    warning.classList.add('hidden');
+    if (refresh) {
+      document.querySelectorAll('.outline-slot').forEach((slot) => {
+        slot.innerHTML = '<div class="outline-loading">正在重新整理答题框架…</div>';
+      });
+    }
+
+    try {
+      const res = await fetch(`/api/session/${encodeURIComponent(sid)}/outlines${refresh ? '?refresh=true' : ''}`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '生成失败');
+      if (state.sid !== sid) return; // 用户已经换了一场
+      state.outlines = data.items || [];
+      renderOutlines();
+      status.textContent = '';
+      if (data.warning) {
+        warning.textContent = data.warning;
+        warning.classList.remove('hidden');
+      }
+    } catch (err) {
+      if (state.sid !== sid) return;
+      status.textContent = '';
+      warning.textContent = `答题框架生成失败：${err.message}`;
+      warning.classList.remove('hidden');
+      document.querySelectorAll('.outline-slot').forEach((slot) => { slot.innerHTML = ''; });
+    } finally {
+      if (state.sid === sid) {
+        $('#btnRegenOutlines').disabled = false;
+        $('#btnDownloadCards').disabled = !(state.outlines && state.outlines.length);
+      }
+    }
+  }
+
+  function outlineFor(qid) {
+    return (state.outlines || []).find((o) => String(o.id) === String(qid));
+  }
+
+  function renderOutlines() {
+    document.querySelectorAll('.outline-slot').forEach((slot, index) => {
+      const outline = outlineFor(slot.dataset.qid);
+      slot.innerHTML = outline ? renderOutline(outline, index === 0) : '';
+    });
+    renderCue();
+  }
+
+  function renderOutline(o, open) {
+    const steps = (o.steps || [])
+      .map(
+        (step, i) => `
+        <li>
+          <span class="ol-step-no">${i + 1}</span>
+          <div><b>${esc(step.label)}</b>${
+            step.points
+              ? `<span class="${step.points.startsWith('需要你补充') ? 'ol-need' : ''}">${esc(step.points)}</span>`
+              : '<span class="ol-need">填上你自己的经历或数据</span>'
+          }</div>
+        </li>`
+      )
+      .join('');
+    const chips = (list, cls) => (list || []).map((k) => `<span class="tag ${cls}">${esc(k)}</span>`).join('');
+
+    return `
+      <details class="outline-card" ${open ? 'open' : ''}>
+        <summary>
+          <span class="ol-fw">${esc(o.framework || '答题框架')}</span>
+          ${o.mnemonic ? `<span class="ol-mnemonic">${esc(o.mnemonic)}</span>` : ''}
+          ${o.why ? `<span class="ol-why">${esc(o.why)}</span>` : ''}
+        </summary>
+        <div class="ol-body">
+          ${o.material ? `<div class="ol-line"><em>用哪段素材</em>${esc(o.material)}</div>` : ''}
+          ${o.opening_line ? `<div class="ol-line"><em>第一句</em>「${esc(o.opening_line)}」</div>` : ''}
+          <ol class="ol-steps">${steps}</ol>
+          ${(o.keywords || []).length ? `<div class="ol-line"><em>关键词</em><span class="tag-row">${chips(o.keywords, 'focus')}</span></div>` : ''}
+          ${(o.numbers || []).length ? `<div class="ol-line"><em>数字锚点</em><span class="tag-row">${chips(o.numbers, 'good')}</span></div>` : ''}
+          ${o.short_version ? `<div class="ol-line"><em>30 秒版</em>${esc(o.short_version)}</div>` : ''}
+          ${(o.gaps || []).length ? `<div class="ol-gaps"><em>需要你补充</em><ul>${o.gaps.map((g) => `<li>${esc(g)}</li>`).join('')}</ul></div>` : ''}
+        </div>
+      </details>`;
+  }
+
+  function cardsMarkdown() {
+    const questions = (state.plan && state.plan.questions) || [];
+    const lines = [`# 答题卡 · ${$('#planTitle').textContent}`, ''];
+    questions.forEach((q, index) => {
+      const o = outlineFor(q.id ?? index + 1);
+      lines.push(`## ${index + 1}. ${q.question}`, '');
+      if (!o) { lines.push('（未生成）', ''); return; }
+      lines.push(`- 框架：${o.framework}${o.mnemonic ? `（口诀：${o.mnemonic}）` : ''}`);
+      if (o.material) lines.push(`- 素材：${o.material}`);
+      if (o.opening_line) lines.push(`- 第一句：${o.opening_line}`);
+      if ((o.numbers || []).length) lines.push(`- 数字锚点：${o.numbers.join(' / ')}`);
+      if ((o.keywords || []).length) lines.push(`- 关键词：${o.keywords.join(' / ')}`);
+      lines.push('');
+      (o.steps || []).forEach((s, i) => lines.push(`${i + 1}. **${s.label}**：${s.points || '（待补充）'}`));
+      if (o.short_version) lines.push('', `> 30 秒版：${o.short_version}`);
+      if ((o.gaps || []).length) {
+        lines.push('', '需要补充：');
+        o.gaps.forEach((g) => lines.push(`- [ ] ${g}`));
+      }
+      lines.push('');
+    });
+    return lines.join('\n');
+  }
+
+  function downloadText(text, filename) {
+    const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /* ---------------- 面试中的提词卡 ---------------- */
+
+  function renderCue() {
+    const card = $('#cueCard');
+    const questions = (state.plan && state.plan.questions) || [];
+    if (!questions.length) {
+      card.classList.add('hidden');
+      return;
+    }
+    card.classList.remove('hidden');
+    state.cueIndex = Math.max(0, Math.min(questions.length - 1, state.cueIndex));
+    const q = questions[state.cueIndex];
+    const o = outlineFor(q.id ?? state.cueIndex + 1);
+
+    $('#cueIdx').textContent = `${state.cueIndex + 1} / ${questions.length}`;
+    $('#cueToggle').textContent = state.cueHidden ? '显示' : '隐藏';
+    card.classList.toggle('collapsed', state.cueHidden);
+
+    if (state.cueHidden) {
+      $('#cueBody').innerHTML = '';
+      return;
+    }
+    const steps = o ? (o.steps || []).map((s) => `<span class="cue-step">${esc(s.label)}</span>`).join('<i>→</i>') : '';
+    $('#cueBody').innerHTML = `
+      <div class="cue-q">${esc(q.question)}</div>
+      ${o ? `
+        <div class="cue-mnemonic">${esc(o.mnemonic || o.framework)}</div>
+        <div class="cue-steps">${steps}</div>
+        ${(o.keywords || []).length ? `<div class="cue-keys">${o.keywords.map(esc).join(' · ')}</div>` : ''}
+        ${(o.numbers || []).length ? `<div class="cue-nums">${o.numbers.map(esc).join(' · ')}</div>` : ''}
+      ` : '<div class="muted">答题框架还没生成好</div>'}`;
+  }
+
+  function moveCue(delta) {
+    state.cueIndex += delta;
+    renderCue();
+  }
+
+  /* ---------------- 方法论编辑 ---------------- */
+
+  async function openMethods() {
+    if (state.view === 'live') return; // 面试中不切走，避免打断语音
+    if (state.view !== 'methods') state.viewBeforeMethods = state.view;
+    showView('methods');
+    await loadMethods();
+  }
+
+  async function loadMethods() {
+    $('#methodsError').textContent = '';
+    $('#methodsStatus').textContent = '读取中…';
+    try {
+      const res = await fetch('/api/methods');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '读取失败');
+      $('#methodsText').value = data.text || '';
+      renderMethodsPreview(data.frameworks || []);
+      $('#methodsStatus').textContent = '';
+    } catch (err) {
+      $('#methodsStatus').textContent = '';
+      $('#methodsError').textContent = `读取失败：${err.message}`;
+    }
+  }
+
+  async function saveMethods() {
+    const btn = $('#btnSaveMethods');
+    btn.disabled = true;
+    $('#methodsError').textContent = '';
+    $('#methodsStatus').textContent = '保存中…';
+    try {
+      const res = await fetch('/api/methods', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: $('#methodsText').value }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '保存失败');
+      renderMethodsPreview(data.frameworks || []);
+      $('#methodsStatus').textContent = state.sid
+        ? '已保存。回到方案页点「重新生成」即可按新方法论整理答题框架。'
+        : '已保存。';
+    } catch (err) {
+      $('#methodsStatus').textContent = '';
+      $('#methodsError').textContent = `保存失败：${err.message}`;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function renderMethodsPreview(frameworks) {
+    $('#methodsPreview').innerHTML =
+      frameworks
+        .map(
+          (fw) => `
+        <div class="fw-item">
+          <div class="fw-head"><b>${esc(fw.name)}</b>${fw.mnemonic ? `<span class="ol-mnemonic">${esc(fw.mnemonic)}</span>` : ''}</div>
+          <div class="cue-steps">${fw.steps.map((s) => `<span class="cue-step">${esc(s)}</span>`).join('<i>→</i>')}</div>
+          <div class="q-meta">适用：${fw.types.map((t) => esc(TYPE_LABEL[t] || t)).join('、') || '未指定（作为兜底）'}${fw.duration ? ` · ${esc(fw.duration)}` : ''}</div>
+        </div>`
+        )
+        .join('') || '<p class="hint">还没有识别出框架。</p>';
   }
 
   /* ============================================================
@@ -756,9 +1035,12 @@
     const btn = $('#btnStart');
     if (!state.sid) return;
     btn.disabled = true;
+    AudioCtl.unlock(); // 必须在第一个 await 之前
+    state.cueIndex = 0;
 
     showView('live');
     resetTranscript();
+    renderCue();
     setStatus('准备中', 'busy');
     setLiveState('等待麦克风授权…');
     $('#stageTip').textContent = '浏览器如弹出麦克风授权，请点「允许」';
@@ -767,7 +1049,7 @@
 
     state.ending = false;
     connectSocket();
-    requestAnimationFrame(drawOrb);
+    startOrb();
   }
 
   async function retryConnection() {
@@ -777,10 +1059,12 @@
     }
     clearTimeout(state.connectTimer);
     AudioCtl.stopAll();
+    AudioCtl.unlock(); // 必须在第一个 await 之前
     $('#btnRetry').classList.add('hidden');
 
     showView('live');
     resetTranscript();
+    renderCue();
     setStatus('准备中', 'busy');
     setLiveState('等待麦克风授权…');
     $('#stageTip').textContent = '浏览器如弹出麦克风授权，请点「允许」';
@@ -789,7 +1073,7 @@
 
     state.ending = false;
     connectSocket();
-    requestAnimationFrame(drawOrb);
+    startOrb();
   }
 
   function toggleMic() {
@@ -906,7 +1190,8 @@
             <div class="qbody">
               ${q.what_went_well ? `<h4>做对了什么</h4><p>${esc(q.what_went_well)}</p>` : ''}
               ${q.what_to_improve ? `<h4>问题在哪</h4><p>${esc(q.what_to_improve)}</p>` : ''}
-              ${q.better_answer ? `<h4>可以这样说</h4><div class="better">${esc(q.better_answer)}</div>` : ''}
+              ${q.framework || q.structure_check ? `<h4>结构对照${q.framework ? ` · ${esc(q.framework)}` : ''}</h4><p>${esc(q.structure_check || '')}</p>` : ''}
+              ${q.better_answer ? `<h4>可以这样说${q.framework ? '（按这个结构）' : ''}</h4><div class="better">${esc(q.better_answer)}</div>` : ''}
             </div>
           </details>`;
       })
@@ -1007,14 +1292,7 @@
       const res = await fetch(`/api/session/${state.sid}`);
       const session = await res.json();
       const report = session.report || {};
-      const md = toMarkdown(report);
-      const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `面试复盘-${state.sid}.md`;
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadText(toMarkdown(report), `面试复盘-${state.sid}.md`);
     } catch (err) {
       console.warn(err);
     }
@@ -1042,6 +1320,8 @@
       if (q.answer_summary) lines.push(`- 回答要点：${q.answer_summary}`);
       if (q.what_went_well) lines.push(`- 做对了：${q.what_went_well}`);
       if (q.what_to_improve) lines.push(`- 问题：${q.what_to_improve}`);
+      if (q.framework) lines.push(`- 建议结构：${q.framework}`);
+      if (q.structure_check) lines.push(`- 结构对照：${q.structure_check}`);
       if (q.better_answer) lines.push(`- 可以这样说：${q.better_answer}`);
       lines.push('');
     });
@@ -1070,6 +1350,8 @@
     stopMicWatch();
     clearTimeout(state.connectTimer);
     state.sid = null;
+    state.outlines = null;
+    state.cueIndex = 0;
     state.ending = false;
     state.sessionReady = false;
     state.duration = 0;
@@ -1092,20 +1374,48 @@
   const canvas = $('#orb');
   const ctx2d = canvas.getContext('2d');
   let phase = 0;
+  let orbRunning = false;
+  let lastDebugAt = 0;
+
+  function startOrb() {
+    if (orbRunning) return;
+    orbRunning = true;
+    requestAnimationFrame(drawOrb);
+  }
+
+  // 任何一次点击都尝试恢复被浏览器挂起的音频（Safari / 切后台后常见）
+  document.addEventListener('click', () => {
+    if (AudioCtl.suspended()) AudioCtl.resume();
+  });
 
   function drawOrb() {
-    if ($('#view-live').classList.contains('hidden')) return;
+    if ($('#view-live').classList.contains('hidden')) {
+      orbRunning = false;
+      return;
+    }
 
     const w = canvas.width;
     const cx = w / 2;
-    const level = Math.min(1, AudioCtl.level * 7 + (AudioCtl.speaking ? 0.16 : 0));
+    const m = AudioCtl.meter();
+    // 你说话时用麦克风音量驱动声波球，面试官说话时保持原来的效果
+    const level = Math.min(1, Math.max(AudioCtl.level * 7, m.ratio * 0.8) + (AudioCtl.speaking ? 0.16 : 0));
     const speaking = AudioCtl.speaking;
 
     const bar = $('#micBar');
-    const raw = AudioCtl.rawPeak();
-    if (bar) bar.style.width = `${Math.min(100, Math.round(raw * 160))}%`;
+    if (bar) bar.style.width = `${Math.round(m.ratio * 100)}%`;
+
+    const now = performance.now();
     const dbg = $('#micDebug');
-    if (dbg) dbg.textContent = `worklet ${AudioCtl.level.toFixed(3)} / 原始 ${raw.toFixed(3)}`;
+    if (dbg && now - lastDebugAt > 250) {
+      lastDebugAt = now;
+      const ctxState = AudioCtl.micCtx ? AudioCtl.micCtx.state : '无';
+      const selectShown = !$('#micSelect').classList.contains('hidden');
+      dbg.textContent = `${m.db.toFixed(0)} dB · ${ctxState}${selectShown ? '' : ` · ${AudioCtl.deviceLabel()}`}`;
+      dbg.title = `worklet ${AudioCtl.level.toFixed(3)} / 原始峰值 ${m.peak.toFixed(3)}`;
+      if (AudioCtl.suspended()) {
+        setLiveState('浏览器暂停了音频，点一下页面任意位置恢复');
+      }
+    }
 
     ctx2d.clearRect(0, 0, w, w);
     phase += 0.02;
@@ -1198,6 +1508,25 @@
   $('#btnRetry').addEventListener('click', retryConnection);
   $('#micSelect').addEventListener('change', (event) => switchMic(event.target.value));
   $('#btnBackSetup').addEventListener('click', () => showView('setup'));
+  $('#btnOpenMethods').addEventListener('click', openMethods);
+  $('#btnCloseMethods').addEventListener('click', () => showView(state.viewBeforeMethods || 'setup'));
+  $('#btnSaveMethods').addEventListener('click', saveMethods);
+  $('#btnReloadMethods').addEventListener('click', loadMethods);
+  $('#btnRegenOutlines').addEventListener('click', () => loadOutlines(true));
+  $('#btnDownloadCards').addEventListener('click', () => downloadText(cardsMarkdown(), `答题卡-${state.sid}.md`));
+  $('#cuePrev').addEventListener('click', () => moveCue(-1));
+  $('#cueNext').addEventListener('click', () => moveCue(1));
+  $('#cueToggle').addEventListener('click', () => {
+    state.cueHidden = !state.cueHidden;
+    renderCue();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (state.view !== 'live') return;
+    const tag = (event.target && event.target.tagName) || '';
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) return;
+    if (event.key === 'ArrowLeft') moveCue(-1);
+    if (event.key === 'ArrowRight') moveCue(1);
+  });
   $('#btnFile').addEventListener('click', () => $('#resumeFile').click());
   $('#resumeFile').addEventListener('change', (event) => {
     const file = event.target.files && event.target.files[0];

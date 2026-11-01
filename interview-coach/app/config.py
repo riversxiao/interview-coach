@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
 WEB_DIR = ROOT / "web"
+METHODS_FILE = ROOT / "methods" / "answer-frameworks.md"
 DATA_DIR = ROOT / "data" / "sessions"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 

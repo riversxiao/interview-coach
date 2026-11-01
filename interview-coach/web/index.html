@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>面镜 · 大模型内容安全运营面试陪练</title>
-  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <link rel="stylesheet" href="/static/style.css?v=9" />
 </head>
 <body>
   <div class="noise"></div>
@@ -18,6 +18,7 @@
       </div>
     </div>
     <div class="topbar-right">
+      <button class="link-btn topbar-link" id="btnOpenMethods">答题方法论</button>
       <span class="pill" id="statusPill"><i class="dot"></i><span>未开始</span></span>
       <span class="timer" id="timer">00:00</span>
     </div>
@@ -70,6 +71,14 @@
             <span class="file-name" id="fileName">未选择文件</span>
           </div>
 
+          <label class="field">
+            <span>我的工作素材 <em>选填 · 简历上没写的细节，用来生成答题框架</em></span>
+            <textarea id="materials" rows="7" placeholder="按案例写，越具体越好。例如：
+【案例1 · 新型越狱绕过】3 月发现用户用角色扮演绕过拒答，日均漏放约 200 条。我抽样 500 条做归因，发现是……；先上关键词兜底止损，再和算法同学补了对抗样本，两周后漏放率从 0.8% 降到 0.2%，沉淀了每周红队巡检机制。
+【案例2 · 误伤申诉激增】……
+【常用数据】日均审核量 / 机审覆盖率 / 人审时效 / 申诉率……"></textarea>
+          </label>
+
           <button class="primary wide" id="btnPrepare">
             <span>生成面试方案</span>
             <span class="arrow">→</span>
@@ -120,7 +129,15 @@
           </div>
 
           <div class="block">
-            <div class="block-title">问题清单 <span class="muted" id="questionCount"></span></div>
+            <div class="block-title block-title-row">
+              <span>问题清单 · 答题框架 <span class="muted" id="questionCount"></span></span>
+              <span class="block-actions">
+                <span class="muted" id="outlineStatus"></span>
+                <button class="link-btn" id="btnRegenOutlines" disabled>重新生成</button>
+                <button class="link-btn" id="btnDownloadCards" disabled>下载答题卡</button>
+              </span>
+            </div>
+            <div class="warn-box hidden" id="outlineWarning"></div>
             <ol class="question-list" id="questionList"></ol>
           </div>
         </div>
@@ -135,6 +152,16 @@
           <p class="hint">点击后会请求麦克风权限。面试全程约 20-30 分钟，随时可以结束。</p>
           <button class="primary wide" id="btnStart">开始语音面试</button>
           <div class="warn-box hidden" id="prepWarning"></div>
+
+          <div class="memo-tips">
+            <div class="side-title">怎么用答题卡</div>
+            <ol class="steps">
+              <li><b>记口诀</b><span>每题只记口诀和 3-5 个关键词，不背整段话。</span></li>
+              <li><b>记数字</b><span>每个案例记住 2-3 个关键数字，故事会自己串起来。</span></li>
+              <li><b>出声练</b><span>看卡讲一遍，只看口诀讲一遍，不看卡计时讲一遍。</span></li>
+            </ol>
+            <p class="tip">面试中右侧会显示提词卡，可以随时隐藏，用来模拟真实面试。</p>
+          </div>
         </aside>
       </div>
     </section>
@@ -180,6 +207,18 @@
         </div>
 
         <aside class="card transcript-card">
+          <div class="cue" id="cueCard">
+            <div class="cue-head">
+              <span>提词卡</span>
+              <span class="cue-nav">
+                <button class="link-btn" id="cuePrev" title="上一题（←）">‹</button>
+                <span class="muted" id="cueIdx">-</span>
+                <button class="link-btn" id="cueNext" title="下一题（→）">›</button>
+                <button class="link-btn" id="cueToggle">隐藏</button>
+              </span>
+            </div>
+            <div class="cue-body" id="cueBody"></div>
+          </div>
           <div class="panel-head">
             <span>实时字幕</span>
             <span class="muted" id="turnCount">0 轮</span>
@@ -187,6 +226,38 @@
           <div class="messages" id="messages">
             <div class="empty-hint">对话开始后，字幕会出现在这里。</div>
           </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ============================ 方法论 ============================ -->
+    <section id="view-methods" class="view hidden">
+      <div class="plan-head">
+        <div>
+          <div class="eyebrow">答题方法论 · 可编辑</div>
+          <h1>结构怎么搭，口诀怎么记</h1>
+        </div>
+        <button class="ghost" id="btnCloseMethods">返回</button>
+      </div>
+
+      <div class="layout-2 methods-layout">
+        <div class="card form-card">
+          <p class="hint">
+            这里的内容保存在 <code>methods/answer-frameworks.md</code>。生成答题框架和复盘改写都会按这里的框架来。
+            每个框架是一个 <code>## 名称</code>，下面写 <code>- 适用题型：</code>、<code>- 骨架：A → B → C</code>、<code>- 口诀：</code> 等字段。
+          </p>
+          <textarea id="methodsText" class="methods-editor" spellcheck="false"></textarea>
+          <div class="methods-actions">
+            <button class="primary" id="btnSaveMethods">保存</button>
+            <button class="ghost" id="btnReloadMethods">放弃修改</button>
+            <span class="muted" id="methodsStatus"></span>
+          </div>
+          <div class="form-error" id="methodsError"></div>
+        </div>
+
+        <aside class="card side-card">
+          <div class="side-title">已识别的框架</div>
+          <div id="methodsPreview"></div>
         </aside>
       </div>
     </section>
@@ -204,6 +275,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>

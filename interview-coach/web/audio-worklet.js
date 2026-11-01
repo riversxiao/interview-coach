@@ -37,14 +37,16 @@ class MicProcessor extends AudioWorkletProcessor {
 
       this.level = this.level * 0.88 + Math.abs(sample) * 0.12;
 
-      if (!this.muted) {
-        const s = Math.max(-1, Math.min(1, sample));
-        this.frame[this.frameIdx++] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        if (this.frameIdx === 320) {
-          this.port.postMessage({ pcm: this.frame.buffer.slice(0), level: this.level });
-          this.frame = new Int16Array(320);
-          this.frameIdx = 0;
-        }
+      const s = Math.max(-1, Math.min(1, sample));
+      this.frame[this.frameIdx++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      if (this.frameIdx === 320) {
+        // 静音时只上报音量，不上报 PCM，方便页面仍能显示麦克风是否有声音
+        const msg = this.muted
+          ? { level: this.level }
+          : { pcm: this.frame.buffer.slice(0), level: this.level };
+        this.port.postMessage(msg);
+        this.frame = new Int16Array(320);
+        this.frameIdx = 0;
       }
 
       this.readPos += this.ratio;

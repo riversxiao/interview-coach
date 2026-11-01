@@ -29,6 +29,7 @@ def create_session(
     jd: str,
     resume: str,
     plan: Dict[str, Any],
+    materials: str = "",
 ) -> Dict[str, Any]:
     sid = uuid.uuid4().hex[:12]
     session = {
@@ -40,7 +41,9 @@ def create_session(
         "company": company,
         "jd": jd,
         "resume": resume,
+        "materials": materials,
         "plan": plan,
+        "outlines": None,
         "transcript": [],
         "report": None,
         "duration_sec": 0,
