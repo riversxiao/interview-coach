@@ -70,7 +70,9 @@ PLAN_SYSTEM = """你是一位资深面试教练，长期负责大厂「大模型
 """.replace("{rubric}", RUBRIC_TEXT).replace("{{", "{").replace("}}", "}")
 
 
-def build_plan_user(role: str, level: str, company: str, jd: str, resume: str) -> str:
+def build_plan_user(
+    role: str, level: str, company: str, jd: str, resume: str, materials: str = ""
+) -> str:
     return f"""目标岗位：{role}
 目标级别：{level or "未说明"}
 目标公司：{company or "未说明"}
@@ -80,7 +82,75 @@ def build_plan_user(role: str, level: str, company: str, jd: str, resume: str) -
 
 【候选人简历】
 {resume.strip() or "（未提供，请设计一套覆盖通用能力的面试方案，并在 risks 中注明简历缺失）"}
+
+【候选人补充的工作素材（简历之外的项目、数据、badcase，可信度同简历）】
+{materials.strip() or "（未提供）"}
 """
+
+
+# ---------------------------------------------------------------- 分析脑：答题框架
+
+OUTLINE_SYSTEM = """你是一位面试表达教练，帮候选人把「自己的真实工作内容」整理成好记、好讲的答题框架。
+
+你会拿到：一份答题方法论（包含若干答题框架，每个框架有骨架步骤和口诀）、候选人的简历和补充工作素材、以及面试问题清单。
+你的任务：为每一道题挑一个最合适的框架，然后用候选人自己的素材把骨架填满。
+
+工作原则：
+1. 框架只能从方法论里选，framework 字段必须和方法论里的框架名称完全一致；steps 的 label 必须和该框架骨架的步骤一一对应、顺序一致。
+2. 只用候选人提供的素材（简历 + 工作素材）。素材里没有的经历、数字、结论，绝不编造。某一步缺素材时，points 写「需要你补充：……」，说明应该补什么，并把它列进 gaps。
+3. points 写的是「这一步讲什么」的要点，不是完整讲稿。每步 1-2 句，口语化，第一人称。
+4. keywords 是开口时看一眼就能想起整段内容的提示词，3-5 个，每个不超过 6 个字。
+5. numbers 只放素材中真实出现的数字（量级、比例、时效、前后对比），没有就给空数组。
+6. mnemonic 优先用该框架的口诀；如果能结合本题素材做一个更好记的版本（例如把每步换成本案例的关键词首字），可以替换，但长度不超过 12 个字。
+7. opening_line 是这道题的第一句话，必须结论先行，30 字以内，能直接念出来。
+8. short_version 是 30 秒版本，3 句以内，只保留骨架和最关键的一个数字。
+9. 同一个案例可以在多道题里复用，但要说明从哪个角度讲。
+
+只输出 JSON，不要任何解释文字。JSON 结构：
+{
+  "outlines": [
+    {
+      "id": 1,
+      "framework": "方法论中的框架名称",
+      "why": "为什么这道题用这个框架，20 字以内",
+      "material": "这道题选用的核心素材（哪段经历/哪个案例），30 字以内",
+      "mnemonic": "口诀",
+      "opening_line": "第一句话",
+      "steps": [{"label": "骨架步骤名", "points": "这一步讲什么"}],
+      "keywords": ["..."],
+      "numbers": ["..."],
+      "short_version": "30 秒版本",
+      "gaps": ["需要候选人补充的信息"]
+    }
+  ]
+}
+"""
+
+
+def build_outline_user(
+    methods_text: str, plan: dict, resume: str, materials: str, jd: str = ""
+) -> str:
+    questions = "\n".join(
+        f"{q.get('id')}. [{q.get('type', '')}] {q.get('question', '')}"
+        f"（考察：{q.get('intent', '')}；合格线：{'；'.join(q.get('expected_points') or [])}）"
+        for q in plan.get("questions", [])
+    )
+    return f"""【答题方法论】
+{methods_text or "（未提供方法论，请使用 STAR 结构）"}
+
+【岗位 JD】
+{(jd or "（未提供）")[:3000]}
+
+【候选人简历】
+{(resume or "（未提供）")[:6000]}
+
+【候选人补充的工作素材】
+{(materials or "（未提供）")[:6000]}
+
+【面试问题清单】
+{questions}
+
+请为以上每一道题输出答题框架，id 与问题编号一致。"""
 
 
 # ---------------------------------------------------------------- 语音脑：面试官人设
@@ -185,7 +255,9 @@ REPORT_SYSTEM = """你是一位极其严格但公正的面试评估专家，擅�
       "score": 0,
       "what_went_well": "做对了什么",
       "what_to_improve": "具体问题，指出破绽",
-      "better_answer": "如果重来一次，应该怎么答。给出 3-5 句可直接复述的示范"
+      "framework": "这道题建议使用的答题框架名称，必须来自给定的答题方法论",
+      "structure_check": "对照该框架的骨架，候选人哪几步讲到了、哪几步缺失或顺序混乱，一句话",
+      "better_answer": "如果重来一次，应该怎么答。严格按该框架的骨架顺序，给出 3-5 句可直接复述的示范，只使用候选人说过的或材料中真实存在的信息"
     }}
   ],
   "top_gaps": [
@@ -202,14 +274,22 @@ def build_report_user(
     transcript_text: str,
     jd: str = "",
     resume: str = "",
+    materials: str = "",
+    methods_text: str = "",
 ) -> str:
     import json
 
-    return f"""【目标岗位 JD】
+    return f"""【答题方法论（better_answer 和 structure_check 按这里的框架来写）】
+{methods_text or "（未提供，按 STAR 结构）"}
+
+【目标岗位 JD】
 {(jd or "（未提供）")[:3000]}
 
 【候选人简历】
 {(resume or "（未提供）")[:4000]}
+
+【候选人补充的工作素材】
+{(materials or "（未提供）")[:4000]}
 
 【面试方案（含考察意图）】
 {json.dumps(plan, ensure_ascii=False, indent=2)}

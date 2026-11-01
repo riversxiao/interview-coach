@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
-from . import prompts
+from . import methods, prompts
 from .config import settings
 
 DEFAULT_QUESTIONS: List[Dict[str, Any]] = [
@@ -140,11 +140,11 @@ class Brain:
         return _loads_json(text)
 
     async def build_plan(
-        self, role: str, level: str, company: str, jd: str, resume: str
+        self, role: str, level: str, company: str, jd: str, resume: str, materials: str = ""
     ) -> Dict[str, Any]:
         plan = await self._json(
             prompts.PLAN_SYSTEM,
-            prompts.build_plan_user(role, level, company, jd, resume),
+            prompts.build_plan_user(role, level, company, jd, resume, materials),
             settings.brain_model,
         )
         plan.setdefault("opening", "你好，我是今天的面试官。先做个自我介绍吧。")
@@ -154,16 +154,39 @@ class Brain:
         plan["brain_enabled"] = True
         return plan
 
+    async def build_outlines(
+        self,
+        plan: Dict[str, Any],
+        resume: str = "",
+        materials: str = "",
+        jd: str = "",
+    ) -> List[Dict[str, Any]]:
+        parsed = methods.load()
+        data = await self._json(
+            prompts.OUTLINE_SYSTEM,
+            prompts.build_outline_user(methods.prompt_text(parsed), plan, resume, materials, jd),
+            settings.brain_model,
+        )
+        return normalize_outlines(data.get("outlines") or [], plan, parsed["frameworks"])
+
     async def build_report(
         self,
         plan: Dict[str, Any],
         transcript_text: str,
         jd: str = "",
         resume: str = "",
+        materials: str = "",
     ) -> Dict[str, Any]:
         report = await self._json(
             prompts.REPORT_SYSTEM,
-            prompts.build_report_user(plan, transcript_text, jd=jd, resume=resume),
+            prompts.build_report_user(
+                plan,
+                transcript_text,
+                jd=jd,
+                resume=resume,
+                materials=materials,
+                methods_text=methods.prompt_text(methods.load()),
+            ),
             settings.brain_report_model,
         )
         report["generated_by"] = settings.brain_report_model
@@ -207,6 +230,85 @@ def _normalize_dimensions(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             }
         )
     return normalized
+
+
+def _str_list(value: Any, limit: int = 8) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if str(v).strip()][:limit]
+
+
+def static_outline(question: Dict[str, Any], framework: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """没有分析脑或模型漏题时的兜底：只给结构，不填素材。"""
+    fw = framework or {"name": "", "steps": [], "mnemonic": "", "opening": ""}
+    return {
+        "id": question.get("id"),
+        "framework": fw["name"],
+        "why": "按题型匹配的默认框架",
+        "material": "",
+        "mnemonic": fw.get("mnemonic", ""),
+        "opening_line": fw.get("opening", ""),
+        "steps": [{"label": s, "points": ""} for s in fw.get("steps", [])],
+        "keywords": [],
+        "numbers": [],
+        "short_version": "",
+        "gaps": ["未生成个性化内容：请在每一步填上你自己的经历和数据"],
+        "personalized": False,
+    }
+
+
+def normalize_outlines(
+    raw: List[Dict[str, Any]],
+    plan: Dict[str, Any],
+    frameworks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """按问题顺序对齐模型输出；框架名对不上或缺题时，用题型默认框架兜底。"""
+    by_name = {fw["name"]: fw for fw in frameworks}
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for item in raw:
+        if isinstance(item, dict) and item.get("id") is not None:
+            by_id.setdefault(str(item["id"]), item)
+
+    result: List[Dict[str, Any]] = []
+    for q in plan.get("questions", []):
+        default_fw = methods.pick_for_type(frameworks, q.get("type", ""))
+        item = by_id.get(str(q.get("id")))
+        if not item:
+            result.append(static_outline(q, default_fw))
+            continue
+
+        fw = by_name.get(str(item.get("framework") or "").strip()) or default_fw
+        steps = []
+        for step in item.get("steps") or []:
+            if isinstance(step, dict) and (step.get("label") or step.get("points")):
+                steps.append(
+                    {"label": str(step.get("label") or "").strip(), "points": str(step.get("points") or "").strip()}
+                )
+        if not steps and fw:
+            steps = [{"label": s, "points": ""} for s in fw["steps"]]
+
+        result.append(
+            {
+                "id": q.get("id"),
+                "framework": fw["name"] if fw else str(item.get("framework") or ""),
+                "why": str(item.get("why") or "").strip(),
+                "material": str(item.get("material") or "").strip(),
+                "mnemonic": str(item.get("mnemonic") or (fw or {}).get("mnemonic", "")).strip(),
+                "opening_line": str(item.get("opening_line") or "").strip(),
+                "steps": steps,
+                "keywords": _str_list(item.get("keywords"), 6),
+                "numbers": _str_list(item.get("numbers"), 6),
+                "short_version": str(item.get("short_version") or "").strip(),
+                "gaps": _str_list(item.get("gaps"), 6),
+                "personalized": True,
+            }
+        )
+    return result
+
+
+def static_outlines(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    frameworks = methods.load()["frameworks"]
+    return [static_outline(q, methods.pick_for_type(frameworks, q.get("type", ""))) for q in plan.get("questions", [])]
 
 
 def _loads_json(text: str) -> Dict[str, Any]:

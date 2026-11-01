@@ -14,8 +14,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import realtime, store
-from .brain import brain, default_plan
+from . import methods, realtime, store
+from .brain import brain, default_plan, static_outlines
 from .config import WEB_DIR, settings
 
 logging.basicConfig(
@@ -42,6 +42,12 @@ class PrepareRequest(BaseModel):
     company: str = ""
     jd: str = ""
     resume: str = ""
+    # 简历之外的工作素材：项目细节、数据、badcase，用于出题和答题框架
+    materials: str = Field(default="", max_length=20000)
+
+
+class MethodsRequest(BaseModel):
+    text: str = Field(..., max_length=200000)
 
 
 class ReportRequest(BaseModel):
@@ -99,13 +105,14 @@ async def prepare(req: PrepareRequest) -> JSONResponse:
     company = (req.company or "").strip()
     jd = (req.jd or "").strip()
     resume = (req.resume or "").strip()
+    materials = (req.materials or "").strip()
 
     plan: Dict[str, Any]
     warning: Optional[str] = None
 
-    if brain.ready and (jd or resume):
+    if brain.ready and (jd or resume or materials):
         try:
-            plan = await brain.build_plan(role, level, company, jd, resume)
+            plan = await brain.build_plan(role, level, company, jd, resume, materials)
         except Exception as exc:
             logging.exception("build plan failed")
             plan = default_plan(role, level)
@@ -118,7 +125,8 @@ async def prepare(req: PrepareRequest) -> JSONResponse:
             warning = "没有提供 JD 或简历，本次使用通用方案。"
 
     session = store.create_session(
-        role=role, level=level, company=company, jd=jd, resume=resume, plan=plan
+        role=role, level=level, company=company, jd=jd, resume=resume, plan=plan,
+        materials=materials,
     )
     return JSONResponse(
         {
@@ -129,6 +137,65 @@ async def prepare(req: PrepareRequest) -> JSONResponse:
             "warning": warning,
         }
     )
+
+
+@app.get("/api/methods")
+async def get_methods() -> Dict[str, Any]:
+    text = methods.read_text()
+    parsed = methods.parse(text)
+    return {"text": text, "frameworks": parsed["frameworks"], "general": parsed["general"]}
+
+
+@app.put("/api/methods")
+async def put_methods(req: MethodsRequest) -> Dict[str, Any]:
+    try:
+        parsed = methods.write_text(req.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "frameworks": parsed["frameworks"], "general": parsed["general"]}
+
+
+@app.post("/api/session/{sid}/outlines")
+async def build_outlines(sid: str, refresh: bool = False) -> JSONResponse:
+    """为方案里的每道题生成答题框架。已生成过的直接返回，refresh=true 时重新生成。"""
+    session = store.get_session(sid)
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    cached = session.get("outlines")
+    if cached and not refresh:
+        return JSONResponse(cached)
+
+    plan = session.get("plan") or {}
+    warning: Optional[str] = None
+    has_material = bool(session.get("resume") or session.get("materials"))
+
+    if brain.ready and has_material:
+        try:
+            items = await brain.build_outlines(
+                plan,
+                resume=session.get("resume", ""),
+                materials=session.get("materials", ""),
+                jd=session.get("jd", ""),
+            )
+        except Exception as exc:
+            logging.exception("build outlines failed")
+            items = static_outlines(plan)
+            warning = f"生成个性化框架失败，先给出通用结构：{exc}"
+    else:
+        items = static_outlines(plan)
+        warning = (
+            "未配置 BRAIN_API_KEY，只给出按题型匹配的通用结构，需要你自己往里填素材。"
+            if not brain.ready
+            else "没有简历或工作素材，只给出通用结构。"
+        )
+
+    result = {"items": items, "warning": warning}
+    # 只缓存成功的个性化结果，失败的下次还会重试
+    if not warning:
+        session["outlines"] = result
+        store.save_session(session)
+    return JSONResponse(result)
 
 
 @app.get("/api/session/{sid}")
@@ -176,6 +243,7 @@ async def build_report(sid: str, req: ReportRequest) -> JSONResponse:
             transcript,
             jd=session.get("jd", ""),
             resume=session.get("resume", ""),
+            materials=session.get("materials", ""),
         )
     except Exception as exc:
         logging.exception("build report failed")
