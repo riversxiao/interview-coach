@@ -48,6 +48,21 @@
     speaking: false,
     muted: false,
     onFrame: null,
+    meterPeak: 0,
+
+    /**
+     * 必须在点击事件里「同步」调用（任何 await 之前）。
+     * Chrome / Safari 的自动播放策略要求 AudioContext 在用户手势内创建并 resume，
+     * 原来的写法是等 getUserMedia 授权弹窗结束后才 new AudioContext，此时手势已失效，
+     * Safari 下 context 会一直停在 suspended，worklet 和分析器都拿不到任何数据。
+     */
+    unlock() {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!this.micCtx || this.micCtx.state === 'closed') this.micCtx = new Ctx();
+      if (!this.playCtx || this.playCtx.state === 'closed') this.playCtx = new Ctx();
+      this.micCtx.resume().catch(() => {});
+      this.playCtx.resume().catch(() => {});
+    },
 
     async init(onFrame) {
       this.onFrame = onFrame;
@@ -55,6 +70,8 @@
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw Object.assign(new Error('当前页面无法使用麦克风'), { name: 'InsecureError' });
       }
+
+      this.unlock();
 
       this.stream = await requestMic({
         audio: {
@@ -65,8 +82,6 @@
         },
       });
 
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      this.micCtx = new Ctx();
       await this.micCtx.audioWorklet.addModule('/static/audio-worklet.js');
 
       const source = this.micCtx.createMediaStreamSource(this.stream);
@@ -91,15 +106,34 @@
         if (data.pcm && this.onFrame) this.onFrame(data.pcm);
       };
 
-      this.playCtx = new Ctx();
       this.gain = this.playCtx.createGain();
       this.gain.gain.value = 1;
       this.gain.connect(this.playCtx.destination);
     },
 
+    // resume 在没有用户手势时可能永远不 resolve，这里加超时，避免整个流程卡死在「等待麦克风授权」
     async resume() {
-      if (this.micCtx && this.micCtx.state !== 'running') await this.micCtx.resume();
-      if (this.playCtx && this.playCtx.state !== 'running') await this.playCtx.resume();
+      const tryResume = (ctx) => {
+        if (!ctx || ctx.state === 'running' || ctx.state === 'closed') return Promise.resolve();
+        return Promise.race([
+          ctx.resume().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]);
+      };
+      await Promise.all([tryResume(this.micCtx), tryResume(this.playCtx)]);
+    },
+
+    suspended() {
+      return [this.micCtx, this.playCtx].some((ctx) => ctx && ctx.state === 'suspended');
+    },
+
+    // 带峰值保持的音量（0-1，按 dB 映射）。原来直接用瞬时峰值 × 160，
+    // 正常说话音量只占 1-5%，4px 高的条几乎看不出来动
+    meter() {
+      const raw = this.rawPeak();
+      this.meterPeak = Math.max(raw, this.meterPeak * 0.92);
+      const db = 20 * Math.log10(this.meterPeak + 1e-6);
+      return { raw, peak: this.meterPeak, db, ratio: Math.max(0, Math.min(1, (db + 60) / 54)) };
     },
 
     setMuted(value) {
@@ -205,6 +239,10 @@
       });
       this.micCtx = null;
       this.playCtx = null;
+      this.analyser = null;
+      this._analyserBuf = null;
+      this.level = 0;
+      this.meterPeak = 0;
     },
   };
 
@@ -756,6 +794,7 @@
     const btn = $('#btnStart');
     if (!state.sid) return;
     btn.disabled = true;
+    AudioCtl.unlock(); // 必须在第一个 await 之前
 
     showView('live');
     resetTranscript();
@@ -767,7 +806,7 @@
 
     state.ending = false;
     connectSocket();
-    requestAnimationFrame(drawOrb);
+    startOrb();
   }
 
   async function retryConnection() {
@@ -777,6 +816,7 @@
     }
     clearTimeout(state.connectTimer);
     AudioCtl.stopAll();
+    AudioCtl.unlock(); // 必须在第一个 await 之前
     $('#btnRetry').classList.add('hidden');
 
     showView('live');
@@ -789,7 +829,7 @@
 
     state.ending = false;
     connectSocket();
-    requestAnimationFrame(drawOrb);
+    startOrb();
   }
 
   function toggleMic() {
@@ -1092,20 +1132,47 @@
   const canvas = $('#orb');
   const ctx2d = canvas.getContext('2d');
   let phase = 0;
+  let orbRunning = false;
+  let lastDebugAt = 0;
+
+  function startOrb() {
+    if (orbRunning) return;
+    orbRunning = true;
+    requestAnimationFrame(drawOrb);
+  }
+
+  // 任何一次点击都尝试恢复被浏览器挂起的音频（Safari / 切后台后常见）
+  document.addEventListener('click', () => {
+    if (AudioCtl.suspended()) AudioCtl.resume();
+  });
 
   function drawOrb() {
-    if ($('#view-live').classList.contains('hidden')) return;
+    if ($('#view-live').classList.contains('hidden')) {
+      orbRunning = false;
+      return;
+    }
 
     const w = canvas.width;
     const cx = w / 2;
-    const level = Math.min(1, AudioCtl.level * 7 + (AudioCtl.speaking ? 0.16 : 0));
+    const m = AudioCtl.meter();
+    // 你说话时用麦克风音量驱动声波球，面试官说话时保持原来的效果
+    const level = Math.min(1, Math.max(AudioCtl.level * 7, m.ratio * 0.8) + (AudioCtl.speaking ? 0.16 : 0));
     const speaking = AudioCtl.speaking;
 
     const bar = $('#micBar');
-    const raw = AudioCtl.rawPeak();
-    if (bar) bar.style.width = `${Math.min(100, Math.round(raw * 160))}%`;
+    if (bar) bar.style.width = `${Math.round(m.ratio * 100)}%`;
+
+    const now = performance.now();
     const dbg = $('#micDebug');
-    if (dbg) dbg.textContent = `worklet ${AudioCtl.level.toFixed(3)} / 原始 ${raw.toFixed(3)}`;
+    if (dbg && now - lastDebugAt > 250) {
+      lastDebugAt = now;
+      const ctxState = AudioCtl.micCtx ? AudioCtl.micCtx.state : '无';
+      dbg.textContent = `${m.db.toFixed(0)} dB · ${ctxState} · ${AudioCtl.deviceLabel()}`;
+      dbg.title = `worklet ${AudioCtl.level.toFixed(3)} / 原始峰值 ${m.peak.toFixed(3)}`;
+      if (AudioCtl.suspended()) {
+        setLiveState('浏览器暂停了音频，点一下页面任意位置恢复');
+      }
+    }
 
     ctx2d.clearRect(0, 0, w, w);
     phase += 0.02;

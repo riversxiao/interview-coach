@@ -510,7 +510,7 @@ button { font-family: inherit; cursor: pointer; border: none; }
 }
 .mic-meter-track {
   width: 132px;
-  height: 4px;
+  height: 6px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.1);
   overflow: hidden;
