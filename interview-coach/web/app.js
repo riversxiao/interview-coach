@@ -2173,7 +2173,8 @@
 
     // 舞台追光
     const energy = Math.max(Face.ai, Face.you * 0.8);
-    const aura = ctx2d.createRadialGradient(w / 2, w * 0.42, w * 0.05, w / 2, w * 0.42, w * 0.55);
+    // 半径不超过画布一半，避免在画布边缘切出方框
+    const aura = ctx2d.createRadialGradient(w / 2, w * 0.45, w * 0.04, w / 2, w * 0.45, w * 0.47);
     aura.addColorStop(0, rgba(tone, 0.2 + energy * 0.25));
     aura.addColorStop(0.5, rgba(tone, 0.06 + energy * 0.08));
     aura.addColorStop(1, rgba(tone, 0));
@@ -2334,17 +2335,17 @@
     });
 
     // 头发：一排毛毡穗，头一动就晃
-    for (let i = 0; i < 9; i++) {
-      const x = -84 + i * 21;
-      const len = 46 + Math.abs(4 - i) * -4 + (i % 2) * 8;
+    for (let i = 0; i < 11; i++) {
+      const x = -100 + i * 20;
+      const len = 96 - Math.abs(5 - i) * 7 + (i % 2) * 10;
       const sway = Face.hair * (0.6 + (i % 3) * 0.2) + Math.sin(t * 1.3 + i) * 0.03;
       ctx2d.save();
-      ctx2d.translate(x, -262 - lift + Math.abs(4 - i) * 3);
-      ctx2d.rotate((i - 4) * 0.13 + sway);
+      ctx2d.translate(x, -248 - lift + Math.abs(5 - i) * 4);
+      ctx2d.rotate((i - 5) * 0.12 + sway);
       const tuft = new Path2D();
-      tuft.moveTo(-12, 6);
-      tuft.quadraticCurveTo(-10, -len * 0.6, 0, -len);
-      tuft.quadraticCurveTo(10, -len * 0.6, 12, 6);
+      tuft.moveTo(-14, 6);
+      tuft.quadraticCurveTo(-12, -len * 0.6, 0, -len);
+      tuft.quadraticCurveTo(12, -len * 0.6, 14, 6);
       tuft.closePath();
       fillFabric(tuft, { kind: 'felt', color: P.hair }, [-4, -len * 0.7, len], false);
       ctx2d.restore();
