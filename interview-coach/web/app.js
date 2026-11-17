@@ -23,6 +23,9 @@
     connectTimer: null,
     micWatch: null,
     sessionReady: false,
+    // 你说完、面试官还没开口的那段时间，「大头」显示思考
+    thinking: false,
+    thinkingSince: 0,
     duration: 0,
     ending: false,
     sending: false,
@@ -57,6 +60,10 @@
     node: null,
     analyser: null,
     _analyserBuf: null,
+    _micFreq: null,
+    playAnalyser: null,
+    _playTime: null,
+    _playFreq: null,
     gain: null,
     sources: new Set(),
     nextTime: 0,
@@ -122,9 +129,53 @@
         if (data.pcm && this.onFrame) this.onFrame(data.pcm);
       };
 
+      this._micFreq = new Uint8Array(this.analyser.frequencyBinCount);
+
+      // 播放链路：gain -> analyser -> 扬声器。analyser 用来让「大头」跟着面试官真实的声音动
       this.gain = this.playCtx.createGain();
       this.gain.gain.value = 1;
-      this.gain.connect(this.playCtx.destination);
+      this.playAnalyser = this.playCtx.createAnalyser();
+      this.playAnalyser.fftSize = 512;
+      this.playAnalyser.smoothingTimeConstant = 0.5;
+      this._playTime = new Float32Array(this.playAnalyser.fftSize);
+      this._playFreq = new Uint8Array(this.playAnalyser.frequencyBinCount);
+      this.gain.connect(this.playAnalyser);
+      this.playAnalyser.connect(this.playCtx.destination);
+    },
+
+    // 面试官 / 教练的声音是否还在扬声器里播（output_audio.done 之后缓冲区里往往还有 1-2 秒）
+    isPlaying() {
+      return !!this.playCtx && this.sources.size > 0;
+    },
+
+    // 播放音量（0-1，按 dB 映射）
+    playLevel() {
+      if (!this.playAnalyser || !this.isPlaying()) return 0;
+      this.playAnalyser.getFloatTimeDomainData(this._playTime);
+      let sum = 0;
+      for (let i = 0; i < this._playTime.length; i++) sum += this._playTime[i] * this._playTime[i];
+      const db = 20 * Math.log10(Math.sqrt(sum / this._playTime.length) + 1e-6);
+      return Math.max(0, Math.min(1, (db + 52) / 40));
+    },
+
+    // 把人声频段（约 90Hz - 5kHz）压成 out.length 个 0-1 的值，低频在前
+    spectrum(which, out) {
+      const node = which === 'play' ? this.playAnalyser : this.analyser;
+      const buf = which === 'play' ? this._playFreq : this._micFreq;
+      if (!node || !buf) return false;
+      node.getByteFrequencyData(buf);
+      const binHz = node.context.sampleRate / node.fftSize;
+      const lo = Math.max(1, Math.round(90 / binHz));
+      const hi = Math.min(buf.length - 1, Math.round(5000 / binHz));
+      const n = out.length;
+      for (let j = 0; j < n; j++) {
+        const pos = lo + (hi - lo) * Math.pow(j / (n - 1), 1.6);
+        const i0 = Math.floor(pos);
+        const f = pos - i0;
+        const v = (buf[i0] * (1 - f) + buf[Math.min(hi, i0 + 1)] * f) / 255;
+        out[j] = Math.max(0, (v - 0.28) / 0.72);
+      }
+      return true;
     },
 
     // resume 在没有用户手势时可能永远不 resolve，这里加超时，避免整个流程卡死在「等待麦克风授权」
@@ -257,6 +308,8 @@
       this.playCtx = null;
       this.analyser = null;
       this._analyserBuf = null;
+      this._micFreq = null;
+      this.playAnalyser = null;
       this.level = 0;
       this.meterPeak = 0;
     },
@@ -942,6 +995,7 @@
     clearTimeout(state.connectTimer);
     AudioCtl.flush();
     AudioCtl.speaking = false;
+    state.thinking = false;
     if (!ws) return;
     ws.intentional = true;
     if (ws.readyState === WebSocket.OPEN) {
@@ -994,6 +1048,7 @@
       case 'conversation.item.input_audio_transcription.started':
         AudioCtl.flush();
         assistantBuf = '';
+        state.thinking = false;
         setLiveState('正在听你说');
         break;
 
@@ -1004,6 +1059,11 @@
 
       case 'conversation.item.input_audio_transcription.completed':
         finalizeBubble('candidate', pickText(evt, 'transcript', 'text'));
+        if (!AudioCtl.isPlaying()) {
+          state.thinking = true;
+          state.thinkingSince = performance.now();
+          setLiveState(state.mode === 'coach' ? '教练在想怎么接…' : '面试官在想…');
+        }
         break;
 
       case 'response.output_text.delta':
@@ -1019,6 +1079,7 @@
 
       case 'response.output_audio.started':
         AudioCtl.speaking = true;
+        state.thinking = false;
         setLiveState(state.mode === 'coach' ? '教练正在说话' : '面试官正在说话');
         break;
 
@@ -1734,19 +1795,417 @@
   }
 
   /* ============================================================
-   * 声波球
+   * 面试官「大头」
+   * 会说：跟着面试官真实声音的音量和频谱鼓起、起伏，声浪向外扩散
+   * 会听：你开口时转成你的颜色，声浪向内收，你每说一句它就轻轻点一下头
+   * 会想：你说完、面试官还没开口时，光点绕着头转
    * ============================================================ */
 
   const canvas = $('#orb');
   const ctx2d = canvas.getContext('2d');
-  let phase = 0;
+  const stageEl = $('.stage');
+  const reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   let orbRunning = false;
   let lastDebugAt = 0;
+
+  const HALF_BARS = 48; // 左右镜像，共 96 根
+  const MOODS = ['connect', 'idle', 'listen', 'think', 'talk'];
+  const MOOD_LABEL = {
+    connect: '连接中',
+    idle: '等你开口',
+    listen: '在听你说',
+    think: '思考中',
+    talk: '说话中',
+  };
+
+  const Face = {
+    t: 0,
+    last: 0,
+    ai: 0,          // 面试官声音能量（平滑后）
+    you: 0,         // 你的声音能量（平滑后）
+    aiAvg: 0,
+    youAvg: 0,
+    youUntil: 0,
+    lastAiBeat: 0,
+    lastYouBeat: 0,
+    nod: 0,
+    nodV: 0,
+    mix: { connect: 1, idle: 0, listen: 0, think: 0, talk: 0 },
+    color: [245, 185, 98],
+    bars: new Float32Array(HALF_BARS),
+    specAi: new Float32Array(HALF_BARS),
+    specYou: new Float32Array(HALF_BARS),
+    ripples: [],
+    sparks: [],
+    mood: '',
+    cssEnergy: -1,
+    cssGlow: '',
+  };
+
+  function moodTones() {
+    const coach = state.mode === 'coach';
+    return {
+      talk: coach ? [95, 227, 200] : [245, 185, 98],
+      listen: coach ? [128, 172, 255] : [95, 227, 200],
+      think: [170, 150, 255],
+      idle: state.muted ? [120, 126, 140] : (coach ? [120, 200, 190] : [214, 180, 130]),
+      connect: [130, 140, 160],
+    };
+  }
+
+  // 指数平滑：上升快、回落慢，像真人说话的起落
+  function follow(cur, target, up, down, dt) {
+    const rate = target > cur ? up : down;
+    return cur + (target - cur) * (1 - Math.exp(-rate * dt));
+  }
+
+  function rgba(c, a) {
+    return `rgba(${c[0] | 0}, ${c[1] | 0}, ${c[2] | 0}, ${Math.max(0, Math.min(1, a)).toFixed(3)})`;
+  }
+
+  function fitCanvas() {
+    const css = canvas.clientWidth;
+    if (!css) return;
+    const size = Math.round(css * Math.min(2, window.devicePixelRatio || 1));
+    if (canvas.width !== size) {
+      canvas.width = size;
+      canvas.height = size;
+    }
+  }
 
   function startOrb() {
     if (orbRunning) return;
     orbRunning = true;
+    Face.last = 0;
     requestAnimationFrame(drawOrb);
+  }
+
+  // 任何一次点击都尝试恢复被浏览器挂起的音频（Safari / 切后台后常见）
+  document.addEventListener('click', () => {
+    if (AudioCtl.suspended()) AudioCtl.resume();
+  });
+
+  function updateMicDebug(m, now) {
+    const bar = $('#micBar');
+    if (bar) bar.style.width = `${Math.round(m.ratio * 100)}%`;
+
+    const dbg = $('#micDebug');
+    if (dbg && now - lastDebugAt > 250) {
+      lastDebugAt = now;
+      const ctxState = AudioCtl.micCtx ? AudioCtl.micCtx.state : '无';
+      const selectShown = !$('#micSelect').classList.contains('hidden');
+      dbg.textContent = `${m.db.toFixed(0)} dB · ${ctxState}${selectShown ? '' : ` · ${AudioCtl.deviceLabel()}`}`;
+      dbg.title = `worklet ${AudioCtl.level.toFixed(3)} / 原始峰值 ${m.peak.toFixed(3)}`;
+      if (AudioCtl.suspended()) {
+        setLiveState('浏览器暂停了音频，点一下页面任意位置恢复');
+      }
+    }
+  }
+
+  function setMood(mood) {
+    const label = mood === 'idle' && state.muted ? '你已静音' : MOOD_LABEL[mood];
+    if (Face.mood === label) return;
+    Face.mood = label;
+    stageEl.dataset.mood = mood;
+    $('#stageMood').textContent = label || '';
+  }
+
+  function emitRipple(dir, color, strength) {
+    if (reduceMotion) return;
+    Face.ripples.push({ dir, color: color.slice(), strength, born: Face.t, life: dir > 0 ? 1.5 : 1.1 });
+    if (Face.ripples.length > 14) Face.ripples.shift();
+  }
+
+  function emitSparks(count, R, color) {
+    if (reduceMotion) return;
+    for (let i = 0; i < count; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const speed = 0.5 + Math.random() * 0.9;
+      Face.sparks.push({
+        a,
+        r: R * (1.05 + Math.random() * 0.1),
+        v: speed,
+        life: 0.9 + Math.random() * 0.8,
+        born: Face.t,
+        size: 1 + Math.random() * 1.8,
+        color: color.slice(),
+      });
+    }
+    if (Face.sparks.length > 160) Face.sparks.splice(0, Face.sparks.length - 160);
+  }
+
+  // 头的轮廓：几组不同频率的正弦叠加，再叠上频谱（低频在下巴，说话时下半部分动得最多）
+  function blobRadius(theta, R, amp, t, seed) {
+    const n = Math.sin(3 * theta + t * 1.3 + seed) * 0.5
+      + Math.sin(5 * theta - t * 0.9 + seed * 1.7) * 0.3
+      + Math.sin(7 * theta + t * 2.1 + seed * 0.6) * 0.2;
+    const k = barIndex(theta);
+    return R * (1 + amp * n + Face.bars[k] * 0.07 * (Face.mix.talk + Face.mix.listen * 0.6));
+  }
+
+  // 角度 -> 频谱下标：正下方是低频，左右对称，越往上频率越高
+  function barIndex(theta) {
+    let a = (theta - Math.PI / 2) % (Math.PI * 2);
+    if (a < 0) a += Math.PI * 2;
+    if (a > Math.PI) a = Math.PI * 2 - a;
+    return Math.min(HALF_BARS - 1, Math.floor((a / Math.PI) * HALF_BARS));
+  }
+
+  function traceBlob(cx, cy, R, amp, t, seed) {
+    const N = 120;
+    ctx2d.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const theta = (i / N) * Math.PI * 2;
+      const r = blobRadius(theta, R, amp, t, seed);
+      const x = cx + Math.cos(theta) * r;
+      const y = cy + Math.sin(theta) * r;
+      if (i === 0) ctx2d.moveTo(x, y);
+      else ctx2d.lineTo(x, y);
+    }
+    ctx2d.closePath();
+  }
+
+  function drawOrb(nowMs) {
+    if ($('#view-live').classList.contains('hidden')) {
+      orbRunning = false;
+      return;
+    }
+    requestAnimationFrame(drawOrb);
+
+    const dt = Face.last ? Math.min(0.05, (nowMs - Face.last) / 1000) : 1 / 60;
+    Face.last = nowMs;
+    Face.t += dt;
+    const t = Face.t;
+
+    fitCanvas();
+    const m = AudioCtl.meter();
+    updateMicDebug(m, performance.now());
+
+    /* ---------- 1. 读信号，判断现在谁在说 ---------- */
+
+    const playing = AudioCtl.isPlaying();
+    const aiRaw = AudioCtl.playLevel();
+    // 底噪大约在 -50 dB 以下（ratio < 0.2），-38 dB 以上才算你在说话
+    const youRaw = state.muted || playing ? 0 : Math.max(0, (m.ratio - 0.3) / 0.7);
+    if (youRaw > 0.12) Face.youUntil = t + 0.45;
+
+    if (playing) state.thinking = false;
+    if (state.thinking && performance.now() - state.thinkingSince > 15000) state.thinking = false;
+
+    let mood = 'idle';
+    if (!state.sessionReady) mood = 'connect';
+    else if (playing) mood = 'talk';
+    else if (t < Face.youUntil) mood = 'listen';
+    else if (state.thinking) mood = 'think';
+    setMood(mood);
+
+    Face.ai = follow(Face.ai, aiRaw, 30, 7, dt);
+    Face.you = follow(Face.you, youRaw, 24, 5, dt);
+    MOODS.forEach((key) => {
+      Face.mix[key] = follow(Face.mix[key], key === mood ? 1 : 0, 6, 4, dt);
+    });
+
+    const tones = moodTones();
+    let total = 0;
+    const color = [0, 0, 0];
+    MOODS.forEach((key) => {
+      const wgt = Face.mix[key];
+      total += wgt;
+      for (let c = 0; c < 3; c++) color[c] += tones[key][c] * wgt;
+    });
+    for (let c = 0; c < 3; c++) Face.color[c] = color[c] / (total || 1);
+    const tone = Face.color;
+
+    // 频谱：说话时用播放频谱，听你说时用麦克风频谱
+    if (playing) AudioCtl.spectrum('play', Face.specAi);
+    else Face.specAi.fill(0);
+    if (!playing && !state.muted) AudioCtl.spectrum('mic', Face.specYou);
+    else Face.specYou.fill(0);
+    for (let j = 0; j < HALF_BARS; j++) {
+      const target = Face.specAi[j] * Face.mix.talk + Face.specYou[j] * Face.mix.listen * 0.8;
+      Face.bars[j] = follow(Face.bars[j], target, 28, 6, dt);
+    }
+
+    const w = canvas.width;
+    const s = w / 720;
+    const cx = w / 2;
+    const energy = Math.max(Face.ai, Face.you * 0.8);
+    const R = w * 0.185 * (
+      1
+      + Math.sin(t * 1.6) * 0.014
+      + Face.ai * 0.2
+      + Face.you * 0.06
+      - Face.mix.think * 0.05
+      - Face.mix.connect * 0.12
+    );
+
+    /* ---------- 2. 节拍：音节起头时发声浪、点头 ---------- */
+
+    Face.aiAvg = follow(Face.aiAvg, aiRaw, 5, 5, dt);
+    Face.youAvg = follow(Face.youAvg, youRaw, 5, 5, dt);
+    if (playing && aiRaw > 0.3 && aiRaw > Face.aiAvg * 1.25 + 0.06 && t - Face.lastAiBeat > 0.16) {
+      Face.lastAiBeat = t;
+      emitRipple(1, tones.talk, aiRaw);
+      emitSparks(Math.round(2 + aiRaw * 6), R, tones.talk);
+      Face.nodV -= 0.35 * aiRaw;
+    }
+    if (mood === 'listen' && youRaw > 0.25 && youRaw > Face.youAvg * 1.3 + 0.06 && t - Face.lastYouBeat > 0.5) {
+      Face.lastYouBeat = t;
+      emitRipple(-1, tones.listen, youRaw);
+      Face.nodV += 0.9 + youRaw * 0.6; // 点头
+    }
+    // 弹簧回位
+    Face.nodV += (-90 * Face.nod - 11 * Face.nodV) * dt;
+    Face.nod += Face.nodV * dt;
+    // 认真听的时候头微微抬起、往前凑
+    const cy = cx + Face.nod * 60 * s - Face.mix.listen * 8 * s;
+
+    /* ---------- 3. 画 ---------- */
+
+    ctx2d.clearRect(0, 0, w, w);
+    ctx2d.globalCompositeOperation = 'source-over';
+
+    // 3.1 氛围光
+    const aura = ctx2d.createRadialGradient(cx, cy, R * 0.6, cx, cy, R * 2.7);
+    aura.addColorStop(0, rgba(tone, 0.16 + energy * 0.24));
+    aura.addColorStop(0.45, rgba(tone, 0.05 + energy * 0.08));
+    aura.addColorStop(1, rgba(tone, 0));
+    ctx2d.fillStyle = aura;
+    ctx2d.fillRect(0, 0, w, w);
+
+    ctx2d.globalCompositeOperation = 'lighter';
+
+    // 3.2 声浪：面试官说话向外扩散，你说话向内收
+    Face.ripples = Face.ripples.filter((rp) => t - rp.born < rp.life);
+    Face.ripples.forEach((rp) => {
+      const p = (t - rp.born) / rp.life;
+      const radius = rp.dir > 0 ? R * (1.08 + p * 1.55) : R * (2.5 - p * 1.35);
+      const alpha = rp.dir > 0 ? Math.pow(1 - p, 2) * 0.5 : Math.sin(Math.PI * p) * 0.32;
+      ctx2d.beginPath();
+      ctx2d.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx2d.strokeStyle = rgba(rp.color, alpha * (0.5 + rp.strength * 0.5));
+      ctx2d.lineWidth = (1.2 + 3 * (1 - p)) * s;
+      ctx2d.stroke();
+    });
+
+    // 3.3 外圈呼吸环
+    for (let ring = 3; ring >= 1; ring--) {
+      const radius = R * 1.18 + ring * 22 * s + Math.sin(t * 1.4 - ring * 0.7) * 6 * s + energy * 20 * s * (4 - ring) / 3;
+      ctx2d.beginPath();
+      ctx2d.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx2d.strokeStyle = rgba(tone, 0.04 + ring * 0.03);
+      ctx2d.lineWidth = 1.1 * s;
+      ctx2d.stroke();
+    }
+
+    // 3.4 连接中：虚线环
+    if (Face.mix.connect > 0.02) {
+      ctx2d.save();
+      ctx2d.setLineDash([8 * s, 12 * s]);
+      ctx2d.lineDashOffset = -t * 60 * s;
+      ctx2d.beginPath();
+      ctx2d.arc(cx, cy, R * 1.35, 0, Math.PI * 2);
+      ctx2d.strokeStyle = rgba(tone, 0.4 * Face.mix.connect);
+      ctx2d.lineWidth = 1.6 * s;
+      ctx2d.stroke();
+      ctx2d.restore();
+    }
+
+    // 3.5 频谱条（镜像，下方低频）
+    const bars = HALF_BARS * 2;
+    const base = R * 1.1;
+    ctx2d.lineCap = 'round';
+    ctx2d.lineWidth = 2.4 * s;
+    for (let k = 0; k < bars; k++) {
+      const theta = Math.PI / 2 + ((k + 0.5) / bars) * Math.PI * 2;
+      const j = barIndex(theta);
+      const idle = Math.sin(t * 2.4 + k * 0.55) * 0.5 + 0.5;
+      const len = (4 + idle * 6 * (1 - Face.mix.think * 0.6) + Face.bars[j] * 96 + energy * 8) * s;
+      // 思考时一束亮光沿着圈转
+      const sweep = Face.mix.think * Math.pow(Math.max(0, Math.cos(theta - t * 3)), 8);
+      const alpha = 0.16 + idle * 0.16 + Face.bars[j] * 0.6 + sweep * 0.6;
+      const x1 = cx + Math.cos(theta) * base;
+      const y1 = cy + Math.sin(theta) * base;
+      const x2 = cx + Math.cos(theta) * (base + len);
+      const y2 = cy + Math.sin(theta) * (base + len);
+      ctx2d.beginPath();
+      ctx2d.moveTo(x1, y1);
+      ctx2d.lineTo(x2, y2);
+      ctx2d.strokeStyle = rgba(tone, alpha);
+      ctx2d.stroke();
+    }
+
+    // 3.6 思考：三颗光点绕头转，带拖尾
+    if (Face.mix.think > 0.02) {
+      for (let c = 0; c < 3; c++) {
+        const head = t * 2.6 + (c * Math.PI * 2) / 3;
+        for (let k = 0; k < 16; k++) {
+          const a = head - k * 0.06;
+          const rr = R * 1.42 + Math.sin(t * 2 + c) * 4 * s;
+          ctx2d.beginPath();
+          ctx2d.arc(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr, (3.2 - k * 0.18) * s, 0, Math.PI * 2);
+          ctx2d.fillStyle = rgba(tones.think, (1 - k / 16) * 0.7 * Face.mix.think);
+          ctx2d.fill();
+        }
+      }
+    }
+
+    // 3.7 头：半透明玻璃球，带左上高光，轮廓随声音起伏
+    const amp = 0.012 + Face.ai * 0.085 + Face.you * 0.035 + Face.mix.think * 0.02;
+    ctx2d.globalCompositeOperation = 'source-over';
+    traceBlob(cx, cy, R, amp, t, 0);
+    const body = ctx2d.createRadialGradient(cx - R * 0.34, cy - R * 0.4, R * 0.04, cx, cy, R * 1.08);
+    body.addColorStop(0, `rgba(255, 248, 236, ${(0.78 + energy * 0.2).toFixed(3)})`);
+    body.addColorStop(0.32, rgba(tone, 0.55 + energy * 0.25));
+    body.addColorStop(0.78, rgba(tone.map((v) => v * 0.45), 0.42));
+    body.addColorStop(1, rgba(tone.map((v) => v * 0.25), 0.3));
+    ctx2d.fillStyle = body;
+    ctx2d.fill();
+
+    ctx2d.globalCompositeOperation = 'lighter';
+    // 内核：说话时一跳一跳地亮
+    const core = ctx2d.createRadialGradient(cx, cy, 0, cx, cy, R * 0.9);
+    core.addColorStop(0, rgba([255, 236, 205], 0.15 + energy * 0.55));
+    core.addColorStop(1, rgba(tone, 0));
+    ctx2d.fillStyle = core;
+    ctx2d.beginPath();
+    ctx2d.arc(cx, cy, R * 0.9, 0, Math.PI * 2);
+    ctx2d.fill();
+
+    // 轮廓光：两层相位错开的描边，让边缘有流动感
+    [[1.0, 0.55, 1.7], [1.05, 0.28, 3.1]].forEach(([scale, a, seed]) => {
+      traceBlob(cx, cy, R * scale, amp * 1.25, t * 1.15, seed);
+      ctx2d.strokeStyle = rgba(tone, a * (0.6 + energy * 0.4));
+      ctx2d.lineWidth = (scale === 1 ? 2 : 1.2) * s;
+      ctx2d.stroke();
+    });
+
+    // 3.8 火花
+    Face.sparks = Face.sparks.filter((sp) => t - sp.born < sp.life);
+    Face.sparks.forEach((sp) => {
+      const p = (t - sp.born) / sp.life;
+      const r = sp.r + sp.v * p * R * 1.3;
+      const a = sp.a + p * 0.25;
+      ctx2d.beginPath();
+      ctx2d.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, sp.size * s * (1 - p * 0.5), 0, Math.PI * 2);
+      ctx2d.fillStyle = rgba(sp.color, (1 - p) * 0.85);
+      ctx2d.fill();
+    });
+
+    ctx2d.globalCompositeOperation = 'source-over';
+
+    /* ---------- 4. 舞台氛围光跟着一起变 ---------- */
+
+    const e = Math.round(energy * 50) / 50;
+    if (e !== Face.cssEnergy) {
+      Face.cssEnergy = e;
+      stageEl.style.setProperty('--energy', String(e));
+    }
+    const glow = tone.map((v) => Math.round(v / 8) * 8).join(', ');
+    if (glow !== Face.cssGlow) {
+      Face.cssGlow = glow;
+      stageEl.style.setProperty('--glow', glow);
+    }
   }
 
   // 任何一次点击都尝试恢复被浏览器挂起的音频（Safari / 切后台后常见）
