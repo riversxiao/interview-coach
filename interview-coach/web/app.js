@@ -2265,10 +2265,13 @@
     const shift = Face.mouthShift;
 
     // 下巴：嘴角是铰链，中间掉得最多
+    // 上沿往上多画一截，藏在上半个头后面，嘴角闭合时不会露缝
     const jaw = new Path2D();
     jaw.moveTo(-150, -lift * 0.2);
     jaw.bezierCurveTo(-158, 40 + drop * 0.5, -110, 98 + drop, 0, 102 + drop);
     jaw.bezierCurveTo(110, 98 + drop, 158, 40 + drop * 0.5, 150, -lift * 0.2);
+    jaw.lineTo(150, -lift - 40);
+    jaw.lineTo(-150, -lift - 40);
     jaw.closePath();
     fillFabric(jaw, P.jaw, [-50, 30 + drop, 220]);
 
