@@ -2143,8 +2143,8 @@
           const a = head - k * 0.06;
           const rr = R * 1.42 + Math.sin(t * 2 + c) * 4 * s;
           ctx2d.beginPath();
-          ctx2d.arc(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr, (3.2 - k * 0.18) * s, 0, Math.PI * 2);
-          ctx2d.fillStyle = rgba(tones.think, (1 - k / 16) * 0.7 * Face.mix.think);
+          ctx2d.arc(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr, (4.2 - k * 0.22) * s, 0, Math.PI * 2);
+          ctx2d.fillStyle = rgba(tones.think, (1 - k / 16) * 0.95 * Face.mix.think);
           ctx2d.fill();
         }
       }
@@ -2201,7 +2201,7 @@
       Face.cssEnergy = e;
       stageEl.style.setProperty('--energy', String(e));
     }
-    const glow = tone.map((v) => Math.round(v / 8) * 8).join(', ');
+    const glow = tone.map((v) => Math.min(255, Math.round(v / 8) * 8)).join(', ');
     if (glow !== Face.cssGlow) {
       Face.cssGlow = glow;
       stageEl.style.setProperty('--glow', glow);
